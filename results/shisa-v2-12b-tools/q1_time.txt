@@ -1,0 +1,4 @@
+time=2026-08-29T10:28:58.825+09:00 level=INFO msg=audit tool=web_fetch url=https://natalie03.hatenablog.com/entry/system-sekkei-mensetsu host=natalie03.hatenablog.com exit_code=0 bytes=13438 ok=true correlation_id=webf00001
+real 56.12
+user 0.15
+sys 0.07

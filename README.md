@@ -10,9 +10,11 @@
 | `rubric.md` | 採点基準。実測前に固定した5基準×10点、合計50点 |
 | `scripts/run_model.sh` | 1モデルに3問を出題し、回答と所要時間を保存するスクリプト |
 | `scripts/run_all_models.sh` | 複数のGGUFをllama-serverで順に起動して一括計測するスクリプト |
+| `scripts/run_model_tools.sh` | web_searchとweb_fetchの利用を認めた検索併用条件のスクリプト |
 | `results/<モデル名>/q*_raw.txt` | 各問への回答全文（無加工） |
 | `results/<モデル名>/q*_time.txt` | 各問の所要時間（`/usr/bin/time -p`の出力） |
-| `results/<モデル名>/scoring.md` | 採点結果と、基準ごとの根拠 |
+| `results/<モデル名>/scoring.md` | 採点結果と、観点ごとの根拠 |
+| `results/<モデル名>-tools/` | 検索併用条件（web_search / web_fetch許可）の回答と採点 |
 
 ## 前提
 
