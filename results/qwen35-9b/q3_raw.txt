@@ -1,0 +1,213 @@
+# リアルタイムチャットサービス設計案
+
+## 1. システム全体のアーキテクチャ
+
+まず全体の構成から考えます。リアルタイム通信には **WebSocket** が最適です（双方向・低レイテンシ）。サーバーサイドでは以下のマイクロサービス構造を想定します：
+
+- **Chat Gateway**: WebSocket接続の管理、メッセージのルーティング
+- **Message Service**: メッセージ保存、検索、配信ロジック
+- **User Service**: ユーザー管理、オンライン状態の追跡
+- **Room Service**: チャットルーム（1対1/グループ）の管理
+
+データベースは：
+- **PostgreSQL**：ユーザー情報、メタデータ
+- **Redis**：セッション管理、キャッシュ、プッシュ通知キュー
+- **TimeSeries DB または Cassandra**：大量メッセージ保存（按番号順序でパーティション可能）
+
+---
+
+## 2. オフライン時のメッセージ処理（最重要課題）
+
+### 基本方針：**「受信したメッセージをローカルのクエューに格納し、復帰時に配信」**
+
+#### 設計のポイント：
+
+1. **プッシュ通知の仕組み**
+   - ユーザーがオフラインの場合も、新規メッセージを受信するために Web Push Service を活用
+   - Firebase Cloud Messaging (FCM) または Apple Push Notification service (APNs) + サーバーサイドブリッジを組み合わせ
+   - 端末に届いた通知には「新しいメッセージあり」＋チャットルームIDを含める
+
+2. **ローカルキューの設計**
+   ```
+   クライアント側：MessageQueueDB（SQLiteまたはIndexedDB）
+     ├── PendingMessages/1234567890 (未配信メッセージ)
+     └── MessageSyncState/user_id/room_id (同期状態管理)
+   ```
+
+3. **復帰時の処理フロー**
+   - ユーザーがオンラインになると、クライアントはサーバーに「再接続要求」を送信
+   - サーバー側でこのユーザーの PendingMessageQueue を確認し、未配信メッセージをバッチとして返却
+   - クライアントはローカルキューから取り出し、チャットUI に表示
+
+4. **重要な考慮点：メッセージ順序と重複防止**
+   ```json
+   {
+     "message_id": "msg_123",
+     "sender_user_id": "user_A",
+     "room_type": "private",
+     "created_at": 1698765432,
+     "sequence_number": 1001,  // 同じユーザーのメッセージ内での順序管理
+     "is_offline_delivery": true
+   }
+   ```
+
+---
+
+## 3. リアルタイム通信設計
+
+### WebSocket プロトコル例：
+```javascript
+// クライアント → サーバー: メッセージ送信
+{ type: 'send_message', room_id: 'room_123', message_body: {...} }
+
+// サーバー → クライアント: 新規メッセージ配信（オンライン時）
+{ type: 'receive_message', sequence_number: 1001, is_offline_delivery: false }
+
+// サーバー → クライアント: オフライン復帰時の未読メッセージ
+{ type: 'offline_messages', messages: [msg_1, msg_2], count: 2 }
+```
+
+### メッセージ配信の最適化：
+- **スロットリング**: 連続したメッセージをバッチ処理（例：500ms で最大3件）
+- **優先度制御**: 新規メッセージ > 未読通知 > システム通知
+- **レスポンスタイム**: WebSocket接続の Heartbeat を 30秒に設定、不応時の再接続
+
+---
+
+## 4. チャットルーム設計（1対1とグループ）
+
+### Roomエンティティ：
+```sql
+CREATE TABLE rooms (
+    room_id UUID PRIMARY KEY,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('private', 'group')),
+    
+    -- 1対1の場合: participant_a_user_id, participant_b_user_id
+    -- グループの場合: group_name, creator_user_id
+    
+    created_at TIMESTAMP DEFAULT NOW(),
+    is_archived BOOLEAN DEFAULT FALSE,
+    last_message_at TIMESTAMP,
+    
+    -- インデックス
+    INDEX idx_participant_type (type)
+);
+
+CREATE TABLE room_memberships (
+    user_id UUID NOT NULL,
+    room_id UUID NOT NULL,
+    joined_at TIMESTAMP,
+    PRIMARY KEY (user_id, room_id),
+    FOREIGN KEY (room_id) REFERENCES rooms(room_id)
+);
+```
+
+### 1対1チャット：
+- シングルルームIDを共有（両方とも同じ `private_room_123` に参加）
+- メッセージ送信時に相手の Online Status をチェックし、配信可否判断
+
+### グループチャット：
+- 管理者機能: 参加者の追加/削除権限を持つユーザーの管理テーブル
+- メッセージログをグループ全体で共有
+- スレッド機能の実装（子メッセージの parent_message_id で紐付け）
+
+---
+
+## 5. データモデルの詳細設計
+
+### Messageエンティティ：
+```sql
+CREATE TABLE messages (
+    message_id UUID PRIMARY KEY,
+    room_type VARCHAR(20) NOT NULL,  -- 'private', 'group'
+    
+    -- 1対1の場合: participant_a_user_id, participant_b_user_id
+    -- グループの場合: sender_user_id
+    
+    content TEXT NOT NULL,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    sequence_number BIGINT GENERATED ALWAYS AS (ROW_NUMBER() OVER()) STORED,  -- スクロール時の順序管理
+    
+    INDEX idx_room_created_seq (room_type, room_id, created_at),
+    INDEX idx_offline_delivery (is_offline_delivery)
+);
+
+-- メッセージ削除のシミュレーション（論理的消去）
+CREATE TABLE message_deletes (
+    user_id UUID NOT NULL,
+    message_id UUID NOT NULL,
+    deleted_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, message_id)
+);
+```
+
+### OfflineMessageQueue：
+```sql
+-- サーバー側の未配信メッセージキュー
+CREATE TABLE offline_message_queue (
+    queue_key VARCHAR(100) PRIMARY KEY,  -- format: user_id:room_type:room_id
+    room_type VARCHAR(20),
+    
+    message_data JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    max_retries INTEGER DEFAULT 3,
+    retry_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX idx_queue_user ON offline_message_queue (user_id_prefix);
+```
+
+---
+
+## 6. スケーラビリティと可用性の確保
+
+### Horizontal Scaling:
+- WebSocket Gateway は Nginx または HAProxy でロードバランス
+- Redis Cluster を採用し、セッション状態を分散管理
+- Message Service の Sharding: `room_id` のハッシュ値でパーティション分割
+
+### メッセージ一貫性：
+- **CAP定理**: 可用性と一貫性のトレードオフを考慮
+- オフラインメッセージ再配信時には、**最終的に到達したメッセージのみ表示**（重複防止）
+- クライアント側で `last_sequence_number` を保持し、サーバーとの差分同期
+
+### セキュリティ：
+```javascript
+// WebSocket接続時の認証
+{ 
+  type: 'authenticate',
+  auth_token: "jwt_token_from_login",  // JWT トークン使用
+  device_id: "device_abc123" 
+}
+
+// メッセージ送信時: 署名付きリクエスト
+{
+  type: 'send_message',
+  signature: hmac_sha256(content + timestamp, user_secret),  // データ改ざん防止
+  ...
+}
+```
+
+---
+
+## 7. クライアント側の同期ロジック（簡易フロー）
+
+```javascript
+class ChatSyncManager {
+  constructor() {
+    this.offlineQueue = new Map();  // key: room_id, value: Message[]
+    this.lastSequenceNumber = {};   // { [room_id]: number }
+  }
+
+  async onUserOnline(server) {
+    const pendingMessages = await server.getOfflineMessages(this.user.id);
+    
+    for (const message of pendingMessages) {
+      const roomKey = `${message.room_type}:${message.room_id}`;
+      
+      // ローカルキューに追加
+      if (!this.offlineQueue.has(roomKey)) {
+        this.offlineQueue.set(roomKey, []);
+      }
+      this.offlineQueue.get(roomKey
