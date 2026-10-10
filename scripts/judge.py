@@ -158,3 +158,49 @@ def validate_judgment(text: str, answer: str) -> tuple[dict | None, str | None, 
     if fabricated:
         return None, "引用が回答本文にありません", fabricated
     return obj, None, []
+
+
+PASS_BAND = 0.8
+PASS_MAE = 1.5
+PASS_TOTAL = 20 / 24
+PASS_STABLE = 0.9
+MAX_BIAS = 1.5
+TOTAL_TOLERANCE = 5
+SPAN_TOLERANCE = 2
+
+
+def band(score: int) -> int:
+    return 0 if score <= 3 else 1 if score <= 7 else 2
+
+
+def compare(hand: dict[tuple[str, int], list[int]], judged: dict[tuple[str, int], list[int]]) -> dict:
+    pairs = [(h, j) for key, values in hand.items() for h, j in zip(values, judged[key])]
+    n = len(pairs)
+    return {
+        "band_agree": sum(band(h) == band(j) for h, j in pairs) / n,
+        "mae": sum(abs(h - j) for h, j in pairs) / n,
+        "bias": sum(j - h for h, j in pairs) / n,
+        "total_within": sum(abs(sum(hand[k]) - sum(judged[k])) <= TOTAL_TOLERANCE for k in hand) / len(hand),
+    }
+
+
+def stability(runs: list[dict[tuple[str, int], list[int]]]) -> float:
+    spans = [max(v) - min(v) for key in runs[0] for v in zip(*(run[key] for run in runs))]
+    return sum(s <= SPAN_TOLERANCE for s in spans) / len(spans)
+
+
+def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
+    reasons = []
+    if m["band_agree"] < PASS_BAND:
+        reasons.append(f"レンジ一致が{PASS_BAND:.0%}未満")
+    if m["mae"] > PASS_MAE:
+        reasons.append(f"平均絶対誤差が{PASS_MAE}点超")
+    if m["total_within"] < PASS_TOTAL:
+        reasons.append("合計差5点以内の回答が24回答中20未満")
+    if stable < PASS_STABLE:
+        reasons.append(f"採点ごとの幅2点以内が{PASS_STABLE:.0%}未満")
+    if fabricated:
+        reasons.append(f"引用の捏造が{fabricated}件")
+    if abs(m["bias"]) > MAX_BIAS:
+        reasons.append(f"偏りが±{MAX_BIAS}点超")
+    return reasons

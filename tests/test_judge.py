@@ -176,5 +176,48 @@ class ValidateJudgmentTest(unittest.TestCase):
         self.assertIsNone(self.check(obj)[1])
 
 
+PASSING = {"band_agree": 0.8, "mae": 1.5, "bias": 1.5, "total_within": 20 / 24}
+
+
+class MetricsTest(unittest.TestCase):
+    def test_band_boundaries(self):
+        self.assertEqual([judge.band(s) for s in (0, 3, 4, 7, 8, 10)], [0, 0, 1, 1, 2, 2])
+
+    def test_compare_on_hand_computed_example(self):
+        m = judge.compare({("m", 1): [1, 4, 7, 8, 10]}, {("m", 1): [3, 4, 8, 8, 6]})
+        self.assertAlmostEqual(m["band_agree"], 0.6)
+        self.assertAlmostEqual(m["mae"], 1.4)
+        self.assertAlmostEqual(m["bias"], -0.2)
+        self.assertEqual(m["total_within"], 1.0)
+
+    def test_total_within_boundary_is_five_points(self):
+        hand = {("m", 1): [5, 5, 5, 5, 5], ("m", 2): [5, 5, 5, 5, 5]}
+        judged = {("m", 1): [10, 5, 5, 5, 5], ("m", 2): [10, 6, 5, 5, 5]}
+        self.assertEqual(judge.compare(hand, judged)["total_within"], 0.5)
+
+    def test_stability_counts_spans_up_to_two(self):
+        runs = [{("m", 1): [5, 5, 0, 0, 0]}, {("m", 1): [7, 8, 0, 0, 0]}]
+        self.assertAlmostEqual(judge.stability(runs), 0.8)
+
+    def test_verdict_passes_exactly_at_thresholds(self):
+        self.assertEqual(judge.verdict(PASSING, 0.9, 0), [])
+        self.assertEqual(judge.verdict({**PASSING, "bias": -1.5}, 0.9, 0), [])
+
+    def test_verdict_fails_just_past_each_threshold(self):
+        cases = [
+            ({**PASSING, "band_agree": 0.79}, 0.9, 0, "レンジ一致"),
+            ({**PASSING, "mae": 1.51}, 0.9, 0, "平均絶対誤差"),
+            ({**PASSING, "total_within": 19 / 24}, 0.9, 0, "合計差"),
+            (PASSING, 0.89, 0, "幅"),
+            (PASSING, 0.9, 1, "捏造"),
+            ({**PASSING, "bias": 1.51}, 0.9, 0, "偏り"),
+            ({**PASSING, "bias": -1.51}, 0.9, 0, "偏り"),
+        ]
+        for m, stable, fab, word in cases:
+            reasons = judge.verdict(m, stable, fab)
+            self.assertEqual(len(reasons), 1, word)
+            self.assertIn(word, reasons[0])
+
+
 if __name__ == "__main__":
     unittest.main()
