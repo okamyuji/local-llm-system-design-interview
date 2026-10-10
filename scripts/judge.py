@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -144,7 +145,7 @@ def check_schema(obj) -> str | None:
     criteria = obj["criteria"]
     ids = [c.get("id") if isinstance(c, dict) else None for c in criteria]
     # bool は int の派生型で、1.0 は 1 と等しいので、type で厳密に比べる
-    if len(criteria) != 5 or set(ids) != {1, 2, 3, 4, 5} or any(type(i) is not int for i in ids):
+    if len(criteria) != 5 or any(type(i) is not int for i in ids) or set(ids) != {1, 2, 3, 4, 5}:
         return f"観点の重複か欠落があります: {ids}"
     errors = [e for e in map(check_criterion, criteria) if e]
     if errors:
@@ -160,7 +161,7 @@ def check_criterion(c: dict) -> str | None:
         return f"観点{c['id']}の点数が0〜10の整数ではありません: {score!r}"
     if not isinstance(c.get("reason"), str):
         return f"観点{c['id']}のreasonが文字列ではありません"
-    evidence = c.get("evidence", [])
+    evidence = c.get("evidence")
     if not isinstance(evidence, list) or not all(isinstance(e, str) for e in evidence):
         return f"観点{c['id']}のevidenceが文字列のリストではありません"
     return None
@@ -247,20 +248,20 @@ def http_request(method: str, url: str, key: str, body: dict | None = None) -> b
         raise JudgeError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
     except urllib.error.URLError as e:
         raise JudgeError(f"APIに接続できません: {e.reason}") from e
-    except OSError as e:
+    except (OSError, http.client.HTTPException) as e:
         raise JudgeError(f"APIとの通信に失敗しました: {e}") from e
 
 
 def load_json(raw: bytes):
     try:
         return json.loads(raw)
-    except json.JSONDecodeError as e:
+    except ValueError as e:
         raise JudgeError(f"APIの応答をJSONとして読めません: {raw[:200]!r}") from e
 
 
 def create_batch(requests: list[dict], key: str, http=http_request) -> str:
     res = load_json(http("POST", API, key, {"requests": requests}))
-    if "id" not in res:
+    if not isinstance(res, dict) or "id" not in res:
         raise JudgeError(f"APIの応答にbatch IDがありません: {res}")
     return res["id"]
 
@@ -277,7 +278,7 @@ def get_batch(batch_id: str, key: str, http=http_request) -> dict:
 
 
 def get_results(url: str, key: str, http=http_request) -> list[dict]:
-    return [load_json(line) for line in http("GET", url, key).decode().splitlines() if line.strip()]
+    return [load_json(line) for line in http("GET", url, key).splitlines() if line.strip()]
 
 
 def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
@@ -325,7 +326,7 @@ SHORT_MODEL = {v: k for k, v in MODEL_SHORT.items()}
 
 
 def list_dirs(root: Path) -> list[str]:
-    return sorted(p.parent.name for p in (root / "results").glob("*/q1_raw.txt"))
+    return sorted(p.parent.name for p in (root / "results").glob("*/q1_raw.txt") if not p.parent.is_symlink())
 
 
 def load_answers(root: Path, dirs: list[str]) -> dict[tuple[str, int], str]:
@@ -333,9 +334,12 @@ def load_answers(root: Path, dirs: list[str]) -> dict[tuple[str, int], str]:
     for d in dirs:
         for q in (1, 2, 3):
             path = root / "results" / d / f"q{q}_raw.txt"
-            if not path.exists():
+            if not path.is_file():
                 raise JudgeError(f"回答がありません: {path}")
-            answers[(d, q)] = path.read_text()
+            try:
+                answers[(d, q)] = path.read_text()
+            except UnicodeDecodeError as e:
+                raise JudgeError(f"回答をUTF-8として読めません: {path}") from e
     return answers
 
 
@@ -394,6 +398,8 @@ def cmd_submit(args, root: Path, key: str, http) -> int:
 
 def cmd_collect(args, root: Path, key: str, http) -> int:
     batch = get_batch(args.batch_id, key, http)
+    if not isinstance(batch, dict) or "processing_status" not in batch:
+        raise JudgeError(f"APIの応答にprocessing_statusがありません: {batch}")
     if batch["processing_status"] != "ended":
         print(f"処理中です（{batch['processing_status']}）: {batch['request_counts']}")
         return 2
@@ -438,18 +444,25 @@ def cmd_calibrate(args, root: Path) -> int:
     return 0
 
 
+def scores_by_run(hand: dict, records: list[dict]) -> dict[int, dict[tuple[str, int], list[int]]]:
+    runs: dict[int, dict[tuple[str, int], list[int]]] = {r["run"]: {} for r in records}
+    for r in records:
+        if r["status"] == "ok" and (r["dir"], r["q"]) in hand:
+            runs[r["run"]][(r["dir"], r["q"])] = scores_of(r)
+    return runs
+
+
 def calibrate_model(model: str, hand: dict, records: list[dict]) -> str:
     fabricated = sum(1 for r in records if r.get("fabricated"))
     if fabricated:
         return f"{model}: 不合格（引用の捏造が{fabricated}件）"
-    runs: dict[int, dict[tuple[str, int], list[int]]] = {r["run"]: {} for r in records}
+    runs = scores_by_run(hand, records)
     if len(runs) < REQUIRED_RUNS:
         return f"{model}: 判定不能（採点回数{len(runs)}回、{REQUIRED_RUNS}回必要）"
-    for r in records:
-        if r["status"] == "ok":
-            runs[r["run"]][(r["dir"], r["q"])] = scores_of(r)
+    if 0 not in runs:
+        return f"{model}: 判定不能（1回目の採点がありません）"
     missing = sum(1 for run in runs.values() for k in hand if k not in run)
-    if missing or 0 not in runs:
+    if missing:
         return f"{model}: 判定不能（判定が欠けた回答 {missing}件）"
     m = compare(hand, runs[0])
     stable = stability([runs[k] for k in sorted(runs)])

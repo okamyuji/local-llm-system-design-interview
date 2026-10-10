@@ -1,4 +1,5 @@
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -838,19 +839,84 @@ class CalibrationDetailTest(unittest.TestCase):
             "opus55: 合格\n"
             "  レンジ一致 100.0% / 平均絶対誤差 0.00 / 偏り +0.00 / 合計差5点以内 100.0% / 3回の幅2点以内 100.0%"))
 
-    def test_runs_without_the_first_run_are_undecidable(self):
-        records = [self.record(run, [5, 5, 5, 5, 5]) for run in (1, 2, 3)]
-        self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), "opus55: 判定不能（判定が欠けた回答 0件）")
-
-    def test_criterion_without_evidence_passes_schema(self):
-        obj = make_judgment([1, 2, 3, 4, 5])
-        del obj["criteria"][0]["evidence"]
-        self.assertIsNone(judge.check_schema(obj))
-
     def test_non_json_message_shows_first_200_bytes(self):
         with self.assertRaises(judge.JudgeError) as cm:
             judge.load_json(b"x" * 300)
         self.assertEqual(str(cm.exception), f"APIの応答をJSONとして読めません: {b'x' * 200!r}")
+
+
+class ReviewRound2Test(unittest.TestCase):
+    DIR = CliTest.DIR
+    setUp = CliTest.setUp
+    run_main = CliTest.run_main
+    ended_http = CliTest.ended_http
+    HAND = {("m", 1): [5, 5, 5, 5, 5]}
+
+    def record(self, run, scores, q=1):
+        return {"run": run, "status": "ok", "dir": "m", "q": q, "judgment": make_judgment(scores)}
+
+    def test_unhashable_id_is_invalid_not_crash(self):
+        obj = make_judgment([1, 2, 3, 4, 5])
+        obj["criteria"][0]["id"] = [1]
+        self.assertTrue(judge.check_schema(obj).startswith("観点の重複か欠落があります"))
+
+    def test_missing_evidence_key_is_invalid(self):
+        obj = make_judgment([1, 2, 3, 4, 5])
+        del obj["criteria"][0]["evidence"]
+        self.assertEqual(judge.check_schema(obj), "観点1のevidenceが文字列のリストではありません")
+
+    def test_non_object_batch_response_is_a_clear_error(self):
+        for body in (b"null", b"42", b'"valid"', b"[]"):
+            http = fake_http({("POST", judge.API): body})
+            with self.assertRaisesRegex(judge.JudgeError, "batch IDがありません"):
+                judge.create_batch([], KEY, http)
+
+    def test_incomplete_read_is_wrapped(self):
+        res = mock.MagicMock()
+        res.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b"partial", 100)
+        with mock.patch("urllib.request.urlopen", return_value=res):
+            with self.assertRaisesRegex(judge.JudgeError, "^APIとの通信に失敗しました: "):
+                judge.http_request("GET", judge.API, KEY)
+
+    def test_non_utf8_responses_are_clear_errors(self):
+        with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
+            judge.load_json(b"\x80\x81")
+        http = fake_http({("GET", "https://r"): b'{"a": 1}\n\x80\x81\n'})
+        with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
+            judge.get_results("https://r", KEY, http)
+
+    def test_batch_without_status_is_a_clear_error(self):
+        http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): b"{}"})
+        code, _, err = self.run_main(["collect", "msgbatch_01abc"], http)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "エラー: APIの応答にprocessing_statusがありません: {}\n")
+
+    def test_symlinked_result_dirs_are_not_listed(self):
+        (self.root / "results" / "alias-model").symlink_to(self.root / "results" / self.DIR)
+        self.assertEqual(judge.list_dirs(self.root), [self.DIR])
+
+    def test_answer_path_that_is_a_directory_or_not_utf8_is_a_clear_error(self):
+        q2 = self.root / "results" / self.DIR / "q2_raw.txt"
+        q2.unlink()
+        q2.mkdir()
+        with self.assertRaisesRegex(judge.JudgeError, "回答がありません"):
+            judge.load_answers(self.root, [self.DIR])
+        q2.rmdir()
+        q2.write_bytes(b"\x80\x81")
+        with self.assertRaisesRegex(judge.JudgeError, "回答をUTF-8として読めません"):
+            judge.load_answers(self.root, [self.DIR])
+
+    def test_questions_without_hand_scores_are_ignored(self):
+        records = [self.record(run, [5, 5, 5, 5, 5]) for run in (0, 1, 2)] + [self.record(0, [1, 1, 1, 1, 1], q=3)]
+        self.assertTrue(judge.calibrate_model("opus55", self.HAND, records).startswith("opus55: 合格\n"))
+
+    def test_missing_first_run_has_its_own_message(self):
+        records = [self.record(run, [5, 5, 5, 5, 5]) for run in (1, 2, 3)]
+        self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), "opus55: 判定不能（1回目の採点がありません）")
+
+    def test_fabrication_fails_even_with_a_single_run(self):
+        records = [{"run": 0, "status": "invalid", "dir": "m", "q": 1, "fabricated": ["x"]}]
+        self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), "opus55: 不合格（引用の捏造が1件）")
 
 
 if __name__ == "__main__":
