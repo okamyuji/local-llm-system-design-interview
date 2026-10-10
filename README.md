@@ -60,7 +60,9 @@ AGENT_WS=/path/to/go-llm-agent/llm-agent-workspace \
 bash scripts/run_all_models.sh
 ```
 
-モデルごとにllama-serverをポート8081で起動し、`/health`の応答を待ってから3問を順に出題し、終わったらサーバーを止めて次のモデルへ進む流れです。回答は`results/<モデル名>/q1_raw.txt`〜`q3_raw.txt`へ、所要時間は`q*_time.txt`へ保存されます。
+モデルごとにllama-serverをポート8081で起動し、`/health`の応答を待ってから3問を順に出題し、終わったらサーバーを止めて次のモデルへ進む流れです。回答は`results/<モデル名>/q1_raw.txt`〜`q3_raw.txt`へ、所要時間は`q*_time.txt`へ保存されます。llama-serverのログは`$TMPDIR`に一意な名前で作られ、起動時の行にそのパスが表示されます。
+
+検索併用条件の`run_model_tools.sh`へ渡すconfigでは、`agent.enabled_tools`を`[web_search, web_fetch]`だけにしてください。検索結果の文章に書かれた指示で、shellなどほかのツールが動かないようにするためです。
 
 1モデルだけ測る場合は、llama-serverを自分で起動したうえで`run_model.sh`を直接呼んでください。
 

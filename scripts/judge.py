@@ -63,6 +63,8 @@ def parse_criteria_names(text: str) -> list[str]:
 
 MODEL_SHORT = {"claude-opus-5-5": "opus55"}
 DIR_RE = re.compile(r"[a-zA-Z0-9-]+")
+# 判定モデルが閉じタグと読みうる変種（大文字小文字、空白、改行）もまとめて止める
+CLOSING_TAG_RE = re.compile(r"<\s*/\s*answer\s*>", re.IGNORECASE)
 CUSTOM_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,64}")
 SPLIT_RE = re.compile(r"([a-zA-Z0-9-]+)__q([1-3])__([a-z0-9]+)__r(\d+)")
 
@@ -177,7 +179,7 @@ def find_fabricated(obj: dict, answer: str) -> list[str]:
 def validate_judgment(text: str, answer: str) -> tuple[dict | None, str | None, list[str]]:
     try:
         obj = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None, "JSONとして読めません", []
     error = check_schema(obj)
     if error:
@@ -251,7 +253,10 @@ OPENER = urllib.request.build_opener(NoRedirect)
 
 
 def http_request(method: str, url: str, key: str, body: dict | None = None) -> bytes:
-    parts = urllib.parse.urlsplit(url)
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as e:
+        raise JudgeError(f"APIキーを送らない宛先です: {url}") from e
     if parts.scheme != "https" or parts.netloc != API_HOST:
         raise JudgeError(f"APIキーを送らない宛先です: {url}")
     data = json.dumps(body).encode() if body is not None else None
@@ -439,7 +444,7 @@ def cmd_submit(args, root: Path, key: str, http) -> int:
     ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
            for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
     answers = load_answers(root, dirs)
-    broken = [f"{d}/q{q}_raw.txt" for (d, q), a in answers.items() if "</answer>" in a]
+    broken = [f"{d}/q{q}_raw.txt" for (d, q), a in answers.items() if CLOSING_TAG_RE.search(a)]
     if broken:
         raise JudgeError(f"回答に</answer>が含まれるため区切りが壊れます: {broken}")
     examples = load_examples(root, pick_examples(root, dirs, args.examples), dirs)
