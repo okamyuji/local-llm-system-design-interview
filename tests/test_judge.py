@@ -219,5 +219,90 @@ class MetricsTest(unittest.TestCase):
             self.assertIn(word, reasons[0])
 
 
+KEY = "not-a-real-key"
+
+
+def fake_http(responses):
+    calls = []
+
+    def http(method, url, key, body=None):
+        calls.append((method, url, body))
+        return responses[(method, url)]
+
+    http.calls = calls
+    return http
+
+
+def succeeded(cid, payload):
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    return {"custom_id": cid, "result": {"type": "succeeded", "message": {"content": [{"type": "text", "text": text}]}}}
+
+
+class HttpRequestTest(unittest.TestCase):
+    def test_sends_method_headers_and_json_body(self):
+        res = mock.MagicMock()
+        res.__enter__.return_value.read.return_value = b"{}"
+        with mock.patch("urllib.request.urlopen", return_value=res) as urlopen:
+            self.assertEqual(judge.http_request("POST", judge.API, KEY, {"a": 1}), b"{}")
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.get_header("X-api-key"), KEY)
+        self.assertEqual(req.get_header("Anthropic-version"), "2023-06-01")
+        self.assertEqual(json.loads(req.data), {"a": 1})
+
+    def test_wraps_http_error_with_status_and_body(self):
+        err = urllib.error.HTTPError(judge.API, 401, "Unauthorized", {}, mock.Mock(read=lambda: b"invalid x-api-key"))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaisesRegex(judge.JudgeError, "HTTP 401: invalid x-api-key"):
+                judge.http_request("GET", judge.API, KEY)
+
+    def test_wraps_connection_error(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no route")):
+            with self.assertRaisesRegex(judge.JudgeError, "接続できません"):
+                judge.http_request("GET", judge.API, KEY)
+
+
+class BatchOpsTest(unittest.TestCase):
+    def test_create_batch_posts_requests_and_returns_id(self):
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        self.assertEqual(judge.create_batch([{"custom_id": "x"}], KEY, http), "msgbatch_01abc")
+        self.assertEqual(http.calls, [("POST", judge.API, {"requests": [{"custom_id": "x"}]})])
+
+    def test_get_batch_rejects_path_like_id_without_calling_api(self):
+        http = fake_http({})
+        for bad in ("../x", "msgbatch_01/../a", ""):
+            with self.assertRaisesRegex(judge.JudgeError, "batch ID"):
+                judge.get_batch(bad, KEY, http)
+        self.assertEqual(http.calls, [])
+
+    def test_get_results_parses_jsonl_and_skips_blank_lines(self):
+        http = fake_http({("GET", "https://r"): b'{"a": 1}\n\n{"b": 2}\n'})
+        self.assertEqual(judge.get_results("https://r", KEY, http), [{"a": 1}, {"b": 2}])
+
+
+class ClassifyTest(unittest.TestCase):
+    ANSWERS = {("m", 1): "二重販売を防ぐ。"}
+
+    def test_ok(self):
+        rec = judge.classify(succeeded("m__q1__opus55__r0", make_judgment([1, 2, 3, 4, 5], ["二重販売"])), self.ANSWERS)
+        self.assertEqual((rec["status"], rec["dir"], rec["q"], rec["model"], rec["run"]), ("ok", "m", 1, "opus55", 0))
+        self.assertEqual(rec["judgment"]["criteria"][0]["score"], 1)
+
+    def test_errored_is_kept_without_judgment(self):
+        rec = judge.classify({"custom_id": "m__q1__opus55__r0", "result": {"type": "errored", "error": {}}}, self.ANSWERS)
+        self.assertEqual(rec["status"], "errored")
+        self.assertNotIn("judgment", rec)
+
+    def test_fabricated_is_invalid(self):
+        rec = judge.classify(succeeded("m__q1__opus55__r0", make_judgment([1, 2, 3, 4, 5], ["ない"])), self.ANSWERS)
+        self.assertEqual(rec["status"], "invalid")
+        self.assertEqual(len(rec["fabricated"]), 5)
+
+    def test_cut_off_output_is_invalid_not_crash(self):
+        rec = judge.classify(succeeded("m__q1__opus55__r0", '{"truncated": fal'), self.ANSWERS)
+        self.assertEqual(rec["status"], "invalid")
+        self.assertEqual(rec["raw"], '{"truncated": fal')
+
+
 if __name__ == "__main__":
     unittest.main()

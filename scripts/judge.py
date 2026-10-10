@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
+import urllib.request
 
 HAND_TOTAL_RE = re.compile(r"^## Q([1-3])\b[^\n]*[:：]\s*(\d+)/50\s*$", re.M)
 HAND_ITEM_RE = re.compile(r"^- 観点([1-5])[^:：\n]*[:：]\s*(\d+)点", re.M)
@@ -204,3 +206,54 @@ def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
     if abs(m["bias"]) > MAX_BIAS:
         reasons.append(f"偏りが±{MAX_BIAS}点超")
     return reasons
+
+
+API = "https://api.anthropic.com/v1/messages/batches"
+API_VERSION = "2023-06-01"
+BATCH_ID_RE = re.compile(r"^msgbatch_[A-Za-z0-9]+$")
+
+
+def http_request(method: str, url: str, key: str, body: dict | None = None) -> bytes:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"x-api-key": key, "anthropic-version": API_VERSION, "content-type": "application/json"}
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            return res.read()
+    except urllib.error.HTTPError as e:
+        raise JudgeError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+    except urllib.error.URLError as e:
+        raise JudgeError(f"APIに接続できません: {e.reason}") from e
+
+
+def create_batch(requests: list[dict], key: str, http=http_request) -> str:
+    return json.loads(http("POST", API, key, {"requests": requests}))["id"]
+
+
+def check_batch_id(batch_id: str) -> str:
+    # batch ID は URL とディレクトリ名に使うので、形式外は通さない
+    if not BATCH_ID_RE.match(batch_id):
+        raise JudgeError(f"batch IDの形式が違います: {batch_id!r}")
+    return batch_id
+
+
+def get_batch(batch_id: str, key: str, http=http_request) -> dict:
+    return json.loads(http("GET", f"{API}/{check_batch_id(batch_id)}", key))
+
+
+def get_results(url: str, key: str, http=http_request) -> list[dict]:
+    return [json.loads(line) for line in http("GET", url, key).decode().splitlines() if line.strip()]
+
+
+def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
+    cid = result["custom_id"]
+    dir_name, q, model_short, run = split_custom_id(cid)
+    rec = {"custom_id": cid, "dir": dir_name, "q": q, "model": model_short, "run": run}
+    outcome = result["result"]
+    if outcome["type"] != "succeeded":
+        return {**rec, "status": outcome["type"]}
+    text = "".join(b.get("text", "") for b in outcome["message"]["content"] if b.get("type") == "text")
+    judgment, error, fabricated = validate_judgment(text, answers[(dir_name, q)])
+    if error:
+        return {**rec, "status": "invalid", "error": error, "fabricated": fabricated, "raw": text}
+    return {**rec, "status": "ok", "judgment": judgment}
