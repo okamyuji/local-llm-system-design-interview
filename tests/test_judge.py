@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -224,6 +225,12 @@ class MetricsTest(unittest.TestCase):
 KEY = "not-a-real-key"
 
 
+def copy_result_dir(root, src, dst):
+    shutil.copytree(root / "results" / src, root / "results" / dst)
+    scoring = root / "results" / dst / "scoring.md"
+    scoring.write_text("<!-- 別モデル -->\n" + scoring.read_text(encoding="utf-8"), encoding="utf-8")
+
+
 def fake_http(responses):
     calls = []
 
@@ -279,8 +286,10 @@ class BatchOpsTest(unittest.TestCase):
         self.assertEqual(http.calls, [])
 
     def test_get_results_parses_jsonl_and_skips_blank_lines(self):
-        http = fake_http({("GET", "https://r"): b'{"a": 1}\n\n{"b": 2}\n'})
-        self.assertEqual(judge.get_results("https://r", KEY, http), [{"a": 1}, {"b": 2}])
+        a = {"custom_id": "a", "result": {"type": "errored"}}
+        b = {"custom_id": "b", "result": {"type": "expired"}}
+        http = fake_http({("GET", "https://r"): f"{json.dumps(a)}\n\n{json.dumps(b)}\n".encode()})
+        self.assertEqual(judge.get_results("https://r", KEY, http), [a, b])
 
 
 class ClassifyTest(unittest.TestCase):
@@ -415,7 +424,7 @@ class CliTest(unittest.TestCase):
         http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): b'{"processing_status": "in_progress", "request_counts": {"processing": 3}}'})
         code, out, _ = self.run_main(["collect", "msgbatch_01abc"], http)
         self.assertEqual(code, 2)
-        self.assertIn("in_progress", out)
+        self.assertEqual(out, "処理中です（in_progress）: {'processing': 3}\n")
 
     def test_collect_saves_records_and_writes_draft_without_touching_hand_scores(self):
         scoring = self.root / "results" / self.DIR / "scoring.md"
@@ -476,11 +485,6 @@ class EdgeInputTest(unittest.TestCase):
         self.assertEqual(judge.check_schema([]), "criteriaがありません")
         self.assertEqual(judge.check_schema({"criteria": [1, 2, 3, 4, 5]}),
                          "観点の重複か欠落があります: [None, None, None, None, None]")
-
-    def test_criterion_without_evidence_has_no_fabricated_quotes(self):
-        obj = make_judgment([1, 2, 3, 4, 5])
-        del obj["criteria"][0]["evidence"]
-        self.assertEqual(judge.find_fabricated(obj, "x"), [])
 
     def test_validation_messages_are_exact(self):
         self.assertEqual(judge.validate_judgment("{", "a")[1], "JSONとして読めません")
@@ -642,14 +646,14 @@ class ExamplesAndMarkupTest(unittest.TestCase):
         ])
 
     def test_load_examples_wraps_each_hand_scoring(self):
-        text = judge.load_examples(ROOT, ["qwen35-9b"])
+        text = judge.load_examples(ROOT, ["qwen35-9b"], [])
         scoring = (ROOT / "results" / "qwen35-9b" / "scoring.md").read_text()
         self.assertTrue(text.startswith("次は手採点の採点例です。採点の水準をこの例に合わせてください。\n\n"))
         self.assertIn(f'<example dir="qwen35-9b">\n{scoring}\n</example>', text)
-        self.assertEqual(judge.load_examples(ROOT, []), "")
+        self.assertEqual(judge.load_examples(ROOT, [], []), "")
 
     def test_load_examples_separates_examples_with_blank_line(self):
-        text = judge.load_examples(ROOT, ["qwen35-9b", "gemma4-e4b"])
+        text = judge.load_examples(ROOT, ["qwen35-9b", "gemma4-e4b"], [])
         self.assertIn("\n</example>\n\n<example dir=\"gemma4-e4b\">\n", text)
 
     def test_only_outer_corner_brackets_are_stripped(self):
@@ -658,7 +662,7 @@ class ExamplesAndMarkupTest(unittest.TestCase):
 
     def test_load_examples_requires_hand_scoring(self):
         with self.assertRaisesRegex(judge.JudgeError, "手採点がありません"):
-            judge.load_examples(ROOT, ["no-such-dir"])
+            judge.load_examples(ROOT, ["no-such-dir"], [])
 
 
 class SubmitExamplesTest(unittest.TestCase):
@@ -667,7 +671,7 @@ class SubmitExamplesTest(unittest.TestCase):
     run_main = CliTest.run_main
 
     def add_other_dir(self):
-        shutil.copytree(self.root / "results" / self.DIR, self.root / "results" / "other-model")
+        copy_result_dir(self.root, self.DIR, "other-model")
 
     def submit(self, argv):
         http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
@@ -699,14 +703,14 @@ class SubmitExamplesTest(unittest.TestCase):
         self.assertIn('<example dir="other-model">', http.calls[0][2]["requests"][0]["params"]["system"][1]["text"])
 
 
-class ReviewRound1Test(unittest.TestCase):
+class CliBoundaryTest(unittest.TestCase):
     DIR = CliTest.DIR
     setUp = CliTest.setUp
     run_main = CliTest.run_main
     ended_http = CliTest.ended_http
 
     def add_other_dir(self):
-        shutil.copytree(self.root / "results" / self.DIR, self.root / "results" / "other-model")
+        copy_result_dir(self.root, self.DIR, "other-model")
 
     def post_http(self):
         return fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
@@ -845,7 +849,7 @@ class CalibrationDetailTest(unittest.TestCase):
         self.assertEqual(str(cm.exception), f"APIの応答をJSONとして読めません: {b'x' * 200!r}")
 
 
-class ReviewRound2Test(unittest.TestCase):
+class MalformedInputTest(unittest.TestCase):
     DIR = CliTest.DIR
     setUp = CliTest.setUp
     run_main = CliTest.run_main
@@ -881,15 +885,16 @@ class ReviewRound2Test(unittest.TestCase):
     def test_non_utf8_responses_are_clear_errors(self):
         with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
             judge.load_json(b"\x80\x81")
-        http = fake_http({("GET", "https://r"): b'{"a": 1}\n\x80\x81\n'})
+        http = fake_http({("GET", "https://r"): b'{"custom_id": "a", "result": {"type": "errored"}}\n\x80\x81\n'})
         with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
             judge.get_results("https://r", KEY, http)
 
     def test_batch_without_status_is_a_clear_error(self):
-        http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): b"{}"})
-        code, _, err = self.run_main(["collect", "msgbatch_01abc"], http)
-        self.assertEqual(code, 1)
-        self.assertEqual(err, "エラー: APIの応答にprocessing_statusがありません: {}\n")
+        for body, shown in ((b"{}", "{}"), (b"null", "None"), (b"[]", "[]"), (b"42", "42"),
+                            (b'"processing_status"', "processing_status")):
+            http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): body})
+            code, _, err = self.run_main(["collect", "msgbatch_01abc"], http)
+            self.assertEqual((code, err), (1, f"エラー: APIの応答にprocessing_statusがありません: {shown}\n"), body)
 
     def test_symlinked_result_dirs_are_not_listed(self):
         (self.root / "results" / "alias-model").symlink_to(self.root / "results" / self.DIR)
@@ -917,6 +922,118 @@ class ReviewRound2Test(unittest.TestCase):
     def test_fabrication_fails_even_with_a_single_run(self):
         records = [{"run": 0, "status": "invalid", "dir": "m", "q": 1, "fabricated": ["x"]}]
         self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), "opus55: 不合格（引用の捏造が1件）")
+
+    def test_answers_are_read_as_utf8_regardless_of_locale(self):
+        q1 = self.root / "results" / self.DIR / "q1_raw.txt"
+        q1.write_text("設計の回答", encoding="utf-8")
+        code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import judge; "
+                "print(judge.load_answers(Path(sys.argv[2]), [sys.argv[3]])[(sys.argv[3], 1)].encode('utf-8').hex())")
+        env = {**os.environ, "LC_ALL": "en_US.ISO8859-1", "PYTHONUTF8": "0"}
+        out = subprocess.run([sys.executable, "-X", "utf8=0", "-c", code, str(ROOT / "scripts"), str(self.root), self.DIR],
+                             env=env, capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(bytes.fromhex(out).decode("utf-8"), "設計の回答")
+        q1.write_bytes("設計".encode("shift_jis"))
+        with self.assertRaisesRegex(judge.JudgeError, "回答をUTF-8として読めません"):
+            judge.load_answers(self.root, [self.DIR])
+
+    def test_unreadable_answer_is_a_clear_error(self):
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaisesRegex(judge.JudgeError, "^回答を読めません: .*Permission denied"):
+                judge.load_answers(self.root, [self.DIR])
+
+    def test_hand_scoring_that_is_a_directory_or_not_utf8_is_a_clear_error(self):
+        scoring = self.root / "results" / self.DIR / "scoring.md"
+        scoring.unlink()
+        scoring.mkdir()
+        with self.assertRaisesRegex(judge.JudgeError, "手採点がありません"):
+            judge.read_hand_scoring(self.root, self.DIR)
+        self.assertEqual(judge.pick_examples(self.root, [], None), [])
+        scoring.rmdir()
+        scoring.write_bytes(b"\x80\x81")
+        with self.assertRaisesRegex(judge.JudgeError, "手採点をUTF-8として読めません"):
+            judge.read_hand_scoring(self.root, self.DIR)
+
+    def test_example_with_same_hand_scores_as_a_target_is_rejected(self):
+        for link in (False, True):
+            alias = self.root / "results" / "alias-model"
+            shutil.rmtree(alias, ignore_errors=True)
+            alias.mkdir()
+            for name in ("q1_raw.txt", "q2_raw.txt", "q3_raw.txt", "scoring.md"):
+                target = self.root / "results" / self.DIR / name
+                if link:
+                    (alias / name).symlink_to(target)
+                else:
+                    shutil.copy(target, alias / name)
+            for argv in (["submit", self.DIR], ["submit", "--examples", "alias-model", self.DIR]):
+                http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+                code, _, err = self.run_main(argv, http)
+                self.assertEqual((code, err, http.calls),
+                                 (1, "エラー: 採点対象と同じ手採点を採点例に含めることはできません: ['alias-model']\n", []),
+                                 (link, argv))
+
+    def test_http_error_body_cut_off_is_still_a_clear_error(self):
+        body = mock.MagicMock()
+        body.read.side_effect = http.client.IncompleteRead(b"partial", 100)
+        err = urllib.error.HTTPError(judge.API, 500, "x", {}, body)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(judge.JudgeError) as cm:
+                judge.http_request("GET", judge.API, KEY)
+        self.assertEqual(str(cm.exception), "HTTP 500: (本文を読めません)")
+
+    def test_deeply_nested_json_is_a_clear_error(self):
+        with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
+            judge.load_json(b"[" * 100000 + b"]" * 100000)
+
+    def test_processing_batch_without_counts_still_reports_progress(self):
+        http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): b'{"processing_status": "in_progress"}'})
+        self.assertEqual(self.run_main(["collect", "msgbatch_01abc"], http), (2, "処理中です（in_progress）: None\n", ""))
+
+    def test_ended_batch_without_results_url_is_a_clear_error(self):
+        for body in (b'{"processing_status": "ended"}', b'{"processing_status": "ended", "results_url": null}'):
+            http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): body})
+            code, _, err = self.run_main(["collect", "msgbatch_01abc"], http)
+            self.assertEqual((code, err), (1, "エラー: 終了したバッチにresults_urlがありません\n"), body)
+
+    def test_malformed_result_lines_are_clear_errors(self):
+        lines = (b"[]", b'{"result": {"type": "errored"}}', b'{"custom_id": "x"}',
+                 b'{"custom_id": "x", "result": {}}',
+                 b'{"custom_id": "x", "result": {"type": "succeeded"}}',
+                 b'{"custom_id": "x", "result": {"type": "succeeded", "message": {"content": [1]}}}')
+        for line in lines:
+            http = fake_http({("GET", "https://r"): line})
+            with self.assertRaisesRegex(judge.JudgeError, "^結果の行の形が違います: ", msg=line):
+                judge.get_results("https://r", KEY, http)
+
+    def test_missing_project_files_name_what_is_missing(self):
+        for name, label in (("rubric.md", "採点基準"), ("questions.md", "出題")):
+            for argv in (["submit", self.DIR], ["collect", "msgbatch_01abc"]):
+                self.setUp()
+                (self.root / name).unlink()
+                http = self.ended_http() if argv[0] == "collect" else fake_http({})
+                code, _, err = self.run_main(argv, http)
+                self.assertEqual((code, err), (1, f"エラー: {label}がありません: {self.root / name}\n"), (name, argv))
+
+    def test_malformed_result_line_message_shows_the_line(self):
+        line = {"custom_id": "x", "result": {}, "pad": "y" * 300}
+        http = fake_http({("GET", "https://r"): json.dumps(line).encode()})
+        with self.assertRaises(judge.JudgeError) as cm:
+            judge.get_results("https://r", KEY, http)
+        self.assertEqual(str(cm.exception), f"結果の行の形が違います: {str(line)[:200]}")
+
+    def test_non_utf8_judge_record_is_a_clear_error(self):
+        folder = self.root / "judge-out" / "msgbatch_01abc"
+        folder.mkdir(parents=True)
+        (folder / "a.json").write_bytes(b"\x80\x81")
+        code, _, err = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual((code, err), (1, f"エラー: 判定の記録をUTF-8として読めません: {folder / 'a.json'}\n"))
+
+    def test_unreadable_judge_record_is_a_clear_error(self):
+        folder = self.root / "judge-out" / "msgbatch_01abc"
+        folder.mkdir(parents=True)
+        (folder / "a.json").write_bytes(b"{")
+        code, _, err = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("エラー: 判定の記録をJSONとして読めません: "), err)
 
 
 if __name__ == "__main__":

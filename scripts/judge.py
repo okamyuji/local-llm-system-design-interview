@@ -169,7 +169,7 @@ def check_criterion(c: dict) -> str | None:
 
 def find_fabricated(obj: dict, answer: str) -> list[str]:
     haystack = normalize_quote(answer)
-    quotes = [q for c in obj["criteria"] for q in c.get("evidence", [])]
+    quotes = [q for c in obj["criteria"] for q in c["evidence"]]
     return [q for q in quotes if normalize_quote(q) and normalize_quote(q) not in haystack]
 
 
@@ -245,7 +245,12 @@ def http_request(method: str, url: str, key: str, body: dict | None = None) -> b
         with urllib.request.urlopen(req, timeout=60) as res:
             return res.read()
     except urllib.error.HTTPError as e:
-        raise JudgeError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+        # 本文の読み取りで起きた例外は、この try の後続の except 節では捕まらない
+        try:
+            body = e.read().decode(errors="replace")
+        except (OSError, http.client.HTTPException):
+            body = "(本文を読めません)"
+        raise JudgeError(f"HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
         raise JudgeError(f"APIに接続できません: {e.reason}") from e
     except (OSError, http.client.HTTPException) as e:
@@ -255,7 +260,7 @@ def http_request(method: str, url: str, key: str, body: dict | None = None) -> b
 def load_json(raw: bytes):
     try:
         return json.loads(raw)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise JudgeError(f"APIの応答をJSONとして読めません: {raw[:200]!r}") from e
 
 
@@ -278,7 +283,18 @@ def get_batch(batch_id: str, key: str, http=http_request) -> dict:
 
 
 def get_results(url: str, key: str, http=http_request) -> list[dict]:
-    return [load_json(line) for line in http("GET", url, key).splitlines() if line.strip()]
+    return [check_result_line(load_json(line)) for line in http("GET", url, key).splitlines() if line.strip()]
+
+
+def check_result_line(r) -> dict:
+    ok = (isinstance(r, dict) and isinstance(r.get("custom_id"), str)
+          and isinstance(r.get("result"), dict) and isinstance(r["result"].get("type"), str))
+    if ok and r["result"]["type"] == "succeeded":
+        msg = r["result"].get("message")
+        ok = isinstance(msg, dict) and isinstance(msg.get("content"), list) and all(isinstance(b, dict) for b in msg["content"])
+    if not ok:
+        raise JudgeError(f"結果の行の形が違います: {str(r)[:200]}")
+    return r
 
 
 def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
@@ -325,6 +341,17 @@ DEFAULT_MODEL = "claude-opus-5-5"
 SHORT_MODEL = {v: k for k, v in MODEL_SHORT.items()}
 
 
+def read_file(path: Path, label: str) -> str:
+    if not path.is_file():
+        raise JudgeError(f"{label}がありません: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise JudgeError(f"{label}をUTF-8として読めません: {path}") from e
+    except OSError as e:
+        raise JudgeError(f"{label}を読めません: {path}: {e}") from e
+
+
 def list_dirs(root: Path) -> list[str]:
     return sorted(p.parent.name for p in (root / "results").glob("*/q1_raw.txt") if not p.parent.is_symlink())
 
@@ -333,13 +360,7 @@ def load_answers(root: Path, dirs: list[str]) -> dict[tuple[str, int], str]:
     answers = {}
     for d in dirs:
         for q in (1, 2, 3):
-            path = root / "results" / d / f"q{q}_raw.txt"
-            if not path.is_file():
-                raise JudgeError(f"回答がありません: {path}")
-            try:
-                answers[(d, q)] = path.read_text()
-            except UnicodeDecodeError as e:
-                raise JudgeError(f"回答をUTF-8として読めません: {path}") from e
+            answers[(d, q)] = read_file(root / "results" / d / f"q{q}_raw.txt", "回答")
     return answers
 
 
@@ -348,16 +369,13 @@ def scores_of(rec: dict) -> list[int]:
 
 
 def read_hand_scoring(root: Path, dir_name: str) -> str:
-    path = root / "results" / dir_name / "scoring.md"
-    if not path.exists():
-        raise JudgeError(f"手採点がありません: {path}")
-    return path.read_text()
+    return read_file(root / "results" / dir_name / "scoring.md", "手採点")
 
 
 def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list[str]:
     known = list_dirs(root)
     if chosen is None:
-        return [d for d in known if d not in dirs and (root / "results" / d / "scoring.md").exists()]
+        return [d for d in known if d not in dirs and (root / "results" / d / "scoring.md").is_file()]
     chosen = list(dict.fromkeys(chosen))
     unknown = [d for d in chosen if d not in known]
     if unknown:
@@ -368,16 +386,22 @@ def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list
     return chosen
 
 
-def load_examples(root: Path, dirs: list[str]) -> str:
+def load_examples(root: Path, dirs: list[str], targets: list[str]) -> str:
     if not dirs:
         return ""
-    blocks = [f'<example dir="{d}">\n{read_hand_scoring(root, d)}\n</example>' for d in dirs]
+    texts = {d: read_hand_scoring(root, d) for d in dirs}
+    # 名前が違っても、コピーやリンクで採点対象と同じ手採点を指していれば漏れになる
+    target_texts = {read_hand_scoring(root, t) for t in targets if (root / "results" / t / "scoring.md").is_file()}
+    same = [d for d, text in texts.items() if text in target_texts]
+    if same:
+        raise JudgeError(f"採点対象と同じ手採点を採点例に含めることはできません: {same}")
+    blocks = [f'<example dir="{d}">\n{text}\n</example>' for d, text in texts.items()]
     return "次は手採点の採点例です。採点の水準をこの例に合わせてください。\n\n" + "\n\n".join(blocks)
 
 
 def cmd_submit(args, root: Path, key: str, http) -> int:
-    rubric = (root / "rubric.md").read_text()
-    questions = parse_questions((root / "questions.md").read_text())
+    rubric = read_file(root / "rubric.md", "採点基準")
+    questions = parse_questions(read_file(root / "questions.md", "出題"))
     known = list_dirs(root)
     dirs = list(dict.fromkeys(args.dirs)) or known
     unknown = [d for d in dirs if d not in known]
@@ -387,7 +411,7 @@ def cmd_submit(args, root: Path, key: str, http) -> int:
     ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
            for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
     answers = load_answers(root, dirs)
-    examples = load_examples(root, pick_examples(root, dirs, args.examples))
+    examples = load_examples(root, pick_examples(root, dirs, args.examples), dirs)
     if not examples:
         print("警告: 採点例がありません。校正に合格したのは採点例ありの構成です", file=sys.stderr)
     requests = [build_request(cid, m, rubric, questions[q][1], answers[(d, q)], examples) for cid, m, d, q in ids]
@@ -401,8 +425,10 @@ def cmd_collect(args, root: Path, key: str, http) -> int:
     if not isinstance(batch, dict) or "processing_status" not in batch:
         raise JudgeError(f"APIの応答にprocessing_statusがありません: {batch}")
     if batch["processing_status"] != "ended":
-        print(f"処理中です（{batch['processing_status']}）: {batch['request_counts']}")
+        print(f"処理中です（{batch['processing_status']}）: {batch.get('request_counts')}")
         return 2
+    if not isinstance(batch.get("results_url"), str) or not batch["results_url"]:
+        raise JudgeError("終了したバッチにresults_urlがありません")
     results = get_results(batch["results_url"], key, http)
     dirs = sorted({split_custom_id(r["custom_id"])[0] for r in results})
     answers = load_answers(root, dirs)
@@ -419,8 +445,8 @@ def cmd_collect(args, root: Path, key: str, http) -> int:
 
 
 def write_drafts(root: Path, batch_id: str, records: list[dict]) -> None:
-    titles = {q: t for q, (t, _) in parse_questions((root / "questions.md").read_text()).items()}
-    names = parse_criteria_names((root / "rubric.md").read_text())
+    titles = {q: t for q, (t, _) in parse_questions(read_file(root / "questions.md", "出題")).items()}
+    names = parse_criteria_names(read_file(root / "rubric.md", "採点基準"))
     model = SHORT_MODEL.get(records[0]["model"], records[0]["model"])
     for d in sorted({r["dir"] for r in records}):
         by_q = {r["q"]: r for r in records if r["dir"] == d}
@@ -433,9 +459,16 @@ def load_hand(root: Path, dirs: list[str]) -> dict[tuple[str, int], list[int]]:
     return {(d, q): s for d in dirs for q, s in parse_hand_scores(read_hand_scoring(root, d)).items()}
 
 
+def load_record(path: Path) -> dict:
+    try:
+        return json.loads(read_file(path, "判定の記録"))
+    except (ValueError, RecursionError) as e:
+        raise JudgeError(f"判定の記録をJSONとして読めません: {path}") from e
+
+
 def cmd_calibrate(args, root: Path) -> int:
     folder = root / "judge-out" / check_batch_id(args.batch_id)
-    records = [json.loads(p.read_text()) for p in sorted(folder.glob("*.json"))]
+    records = [load_record(p) for p in sorted(folder.glob("*.json"))]
     if not records:
         raise JudgeError(f"{folder}に判定がありません。先にcollectを実行してください")
     hand = load_hand(root, sorted({r["dir"] for r in records}))
