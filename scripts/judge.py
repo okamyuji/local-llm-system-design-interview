@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from pathlib import Path
@@ -237,12 +238,27 @@ API_VERSION = "2023-06-01"
 BATCH_ID_RE = re.compile(r"msgbatch_[A-Za-z0-9]+")
 
 
+API_HOST = "api.anthropic.com"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # 既定の HTTPRedirectHandler は x-api-key を付けたまま転送先へ送る
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def http_request(method: str, url: str, key: str, body: dict | None = None) -> bytes:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != API_HOST:
+        raise JudgeError(f"APIキーを送らない宛先です: {url}")
     data = json.dumps(body).encode() if body is not None else None
     headers = {"x-api-key": key, "anthropic-version": API_VERSION, "content-type": "application/json"}
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=60) as res:
+        with OPENER.open(req, timeout=60) as res:
             return res.read()
     except urllib.error.HTTPError as e:
         # 本文の読み取りで起きた例外は、この try の後続の except 節では捕まらない
@@ -291,10 +307,14 @@ def check_result_line(r) -> dict:
           and isinstance(r.get("result"), dict) and isinstance(r["result"].get("type"), str))
     if ok and r["result"]["type"] == "succeeded":
         msg = r["result"].get("message")
-        ok = isinstance(msg, dict) and isinstance(msg.get("content"), list) and all(isinstance(b, dict) for b in msg["content"])
+        ok = isinstance(msg, dict) and isinstance(msg.get("content"), list) and all(map(valid_block, msg["content"]))
     if not ok:
         raise JudgeError(f"結果の行の形が違います: {str(r)[:200]}")
     return r
+
+
+def valid_block(b) -> bool:
+    return isinstance(b, dict) and (b.get("type") != "text" or isinstance(b.get("text"), str))
 
 
 def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
@@ -350,6 +370,14 @@ def read_file(path: Path, label: str) -> str:
         raise JudgeError(f"{label}をUTF-8として読めません: {path}") from e
     except OSError as e:
         raise JudgeError(f"{label}を読めません: {path}: {e}") from e
+
+
+def write_file(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        raise JudgeError(f"書き込めません: {path}: {e}") from e
 
 
 def list_dirs(root: Path) -> list[str]:
@@ -411,6 +439,9 @@ def cmd_submit(args, root: Path, key: str, http) -> int:
     ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
            for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
     answers = load_answers(root, dirs)
+    broken = [f"{d}/q{q}_raw.txt" for (d, q), a in answers.items() if "</answer>" in a]
+    if broken:
+        raise JudgeError(f"回答に</answer>が含まれるため区切りが壊れます: {broken}")
     examples = load_examples(root, pick_examples(root, dirs, args.examples), dirs)
     if not examples:
         print("警告: 採点例がありません。校正に合格したのは採点例ありの構成です", file=sys.stderr)
@@ -434,9 +465,8 @@ def cmd_collect(args, root: Path, key: str, http) -> int:
     answers = load_answers(root, dirs)
     records = [classify(r, answers) for r in results]
     out = root / "judge-out" / args.batch_id
-    out.mkdir(parents=True, exist_ok=True)
     for rec in records:
-        (out / f"{rec['custom_id']}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2))
+        write_file(out / f"{rec['custom_id']}.json", json.dumps(rec, ensure_ascii=False, indent=2))
     counts = Counter(rec["status"] for rec in records)
     print(" / ".join(f"{k} {v}" for k, v in sorted(counts.items())) + f"（保存先 {out}）")
     if len({(r["model"], r["run"]) for r in records}) == 1:
@@ -451,7 +481,7 @@ def write_drafts(root: Path, batch_id: str, records: list[dict]) -> None:
     for d in sorted({r["dir"] for r in records}):
         by_q = {r["q"]: r for r in records if r["dir"] == d}
         path = root / "results" / d / "scoring.judge.md"
-        path.write_text(render_scoring(d, model, batch_id, titles, names, by_q))
+        write_file(path, render_scoring(d, model, batch_id, titles, names, by_q))
         print(f"下書きを書きました: {path}")
 
 
@@ -461,9 +491,21 @@ def load_hand(root: Path, dirs: list[str]) -> dict[tuple[str, int], list[int]]:
 
 def load_record(path: Path) -> dict:
     try:
-        return json.loads(read_file(path, "判定の記録"))
+        rec = json.loads(read_file(path, "判定の記録"))
     except (ValueError, RecursionError) as e:
         raise JudgeError(f"判定の記録をJSONとして読めません: {path}") from e
+    if not valid_record(rec):
+        raise JudgeError(f"判定の記録の形が違います: {path}")
+    return rec
+
+
+def valid_record(rec) -> bool:
+    # dir は手採点のパスに入るので、custom_id と同じ形式に限る
+    return (isinstance(rec, dict) and isinstance(rec.get("dir"), str) and DIR_RE.fullmatch(rec["dir"]) is not None
+            and type(rec.get("q")) is int and rec["q"] in (1, 2, 3)
+            and type(rec.get("run")) is int and rec["run"] >= 0
+            and isinstance(rec.get("model"), str) and isinstance(rec.get("status"), str)
+            and (rec["status"] != "ok" or check_schema(rec.get("judgment")) is None))
 
 
 def cmd_calibrate(args, root: Path) -> int:
