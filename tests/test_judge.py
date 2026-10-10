@@ -118,7 +118,7 @@ class BuildRequestTest(unittest.TestCase):
         self.assertEqual(p["max_tokens"], 4096)
         self.assertEqual(p["system"][0], {"type": "text", "text": "RUBRIC", "cache_control": {"type": "ephemeral"}})
         self.assertEqual(p["system"][1], {"type": "text", "text": judge.RULES})
-        self.assertEqual(p["messages"], [{"role": "user", "content": "出題:\n出題文\n\n<answer-n0nce>\n回答本文\n</answer-n0nce>"}])
+        self.assertEqual(p["messages"], [{"role": "user", "content": "出題:\n出題文\n\n回答は<answer-n0nce>と</answer-n0nce>の間です。\n\n<answer-n0nce>\n回答本文\n</answer-n0nce>"}])
         self.assertEqual(p["output_config"], {"format": {"type": "json_schema", "schema": judge.SCHEMA}})
 
     def test_schema_requires_all_fields(self):
@@ -575,7 +575,7 @@ class CliDetailTest(unittest.TestCase):
         for q, r in zip((1, 2, 3), reqs):
             answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
             self.assertEqual(r["params"]["system"][0]["text"], rubric)
-            self.assertEqual(r["params"]["messages"][0]["content"], f"出題:\n{questions[q][1]}\n\n<answer-n0nce>\n{answer}\n</answer-n0nce>")
+            self.assertEqual(r["params"]["messages"][0]["content"], f"出題:\n{questions[q][1]}\n\n回答は<answer-n0nce>と</answer-n0nce>の間です。\n\n<answer-n0nce>\n{answer}\n</answer-n0nce>")
 
     def test_collect_can_run_twice_and_saves_readable_json(self):
         for _ in range(2):
@@ -999,6 +999,24 @@ class MalformedInputTest(unittest.TestCase):
                                  (1, "エラー: 採点対象と同じ手採点または回答を採点例に含めることはできません: ['alias-model']\n", []),
                                  (src, argv))
 
+    def test_example_differing_only_in_invisible_ways_is_rejected(self):
+        import unicodedata
+        target = (self.root / "results" / self.DIR / "scoring.md").read_text(encoding="utf-8")
+        variants = {"trailing-nl": target + "\n", "bom": "\ufeff" + target,
+                    "nfd": unicodedata.normalize("NFD", target), "spaces": target.replace("\n", " \n")}
+        for name, text in variants.items():
+            copy_result_dir(self.root, self.DIR, "alias-model")
+            (self.root / "results" / "alias-model" / "scoring.md").write_text(text, encoding="utf-8")
+            http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+            code, _, err = self.run_main(["submit", "--examples", "alias-model", self.DIR], http)
+            self.assertEqual((code, err, http.calls),
+                             (1, "エラー: 採点対象と同じ手採点または回答を採点例に含めることはできません: ['alias-model']\n", []), name)
+            shutil.rmtree(self.root / "results" / "alias-model")
+        copy_result_dir(self.root, self.DIR, "alias-model")
+        (self.root / "results" / "alias-model" / "scoring.md").write_text("X" + target, encoding="utf-8")
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        self.assertEqual(self.run_main(["submit", "--examples", "alias-model", self.DIR], http)[0], 0)
+
     def test_unreadable_example_answer_names_what_failed(self):
         copy_result_dir(self.root, self.DIR, "other-model")
         bad = self.root / "results" / "other-model" / "q3_raw.txt"
@@ -1192,7 +1210,7 @@ class SecurityBoundaryTest(unittest.TestCase):
     def test_answer_tag_is_unpredictable_per_request(self):
         a = judge.build_request("m__q1__opus55__r0", "claude-opus-5-5", "R", "Q", "A")["params"]["messages"][0]["content"]
         b = judge.build_request("m__q1__opus55__r0", "claude-opus-5-5", "R", "Q", "A")["params"]["messages"][0]["content"]
-        tag = re.fullmatch(r"出題:\nQ\n\n<(answer-[0-9a-f]{16})>\nA\n</\1>", a)
+        tag = re.fullmatch(r"出題:\nQ\n\n回答は<(answer-[0-9a-f]{16})>と</\1>の間です。\n\n<\1>\nA\n</\1>", a)
         self.assertIsNotNone(tag, a)
         self.assertNotEqual(a, b)
 

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,7 +130,7 @@ def build_request(custom_id: str, model: str, rubric: str, question: str, answer
             "model": model,
             "max_tokens": MAX_TOKENS,
             "system": system,
-            "messages": [{"role": "user", "content": f"出題:\n{question}\n\n<{tag}>\n{answer}\n</{tag}>"}],
+            "messages": [{"role": "user", "content": f"出題:\n{question}\n\n回答は<{tag}>と</{tag}>の間です。\n\n<{tag}>\n{answer}\n</{tag}>"}],
             "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
         },
     }
@@ -423,7 +424,9 @@ def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list
 
 def leak_texts(root: Path, dir_name: str) -> set[str]:
     paths = [root / "results" / dir_name / name for name in ("scoring.md", "q1_raw.txt", "q2_raw.txt", "q3_raw.txt")]
-    return {read_file(p, "手採点か回答") for p in paths if p.is_file()}
+    # 保存時に付く末尾の改行・BOM・正規化形の違いでは、同じ内容と見なす
+    return {unicodedata.normalize("NFC", normalize_ws(read_file(p, "手採点か回答").lstrip("\ufeff")))
+            for p in paths if p.is_file()}
 
 
 def load_examples(root: Path, dirs: list[str], targets: list[str]) -> str:
