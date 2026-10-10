@@ -421,15 +421,20 @@ def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list
     return chosen
 
 
+def leak_texts(root: Path, dir_name: str) -> set[str]:
+    paths = [root / "results" / dir_name / name for name in ("scoring.md", "q1_raw.txt", "q2_raw.txt", "q3_raw.txt")]
+    return {read_file(p, "手採点か回答") for p in paths if p.is_file()}
+
+
 def load_examples(root: Path, dirs: list[str], targets: list[str]) -> str:
     if not dirs:
         return ""
     texts = {d: read_hand_scoring(root, d) for d in dirs}
-    # 名前が違っても、コピーやリンクで採点対象と同じ手採点を指していれば漏れになる
-    target_texts = {read_hand_scoring(root, t) for t in targets if (root / "results" / t / "scoring.md").is_file()}
-    same = [d for d, text in texts.items() if text in target_texts]
+    # 名前が違っても、コピーやリンクで採点対象と同じ手採点か回答を持っていれば漏れになる
+    target_texts = set().union(*(leak_texts(root, t) for t in targets))
+    same = [d for d in dirs if leak_texts(root, d) & target_texts]
     if same:
-        raise JudgeError(f"採点対象と同じ手採点を採点例に含めることはできません: {same}")
+        raise JudgeError(f"採点対象と同じ手採点または回答を採点例に含めることはできません: {same}")
     blocks = [f'<example dir="{d}">\n{text}\n</example>' for d, text in texts.items()]
     return "次は手採点の採点例です。採点の水準をこの例に合わせてください。\n\n" + "\n\n".join(blocks)
 

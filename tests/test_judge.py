@@ -232,8 +232,9 @@ KEY = "not-a-real-key"
 
 def copy_result_dir(root, src, dst):
     shutil.copytree(root / "results" / src, root / "results" / dst)
-    scoring = root / "results" / dst / "scoring.md"
-    scoring.write_text("<!-- 別モデル -->\n" + scoring.read_text(encoding="utf-8"), encoding="utf-8")
+    for name in ("scoring.md", "q1_raw.txt", "q2_raw.txt", "q3_raw.txt"):
+        f = root / "results" / dst / name
+        f.write_text("<!-- 別モデル -->\n" + f.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def fake_http(responses):
@@ -974,8 +975,37 @@ class MalformedInputTest(unittest.TestCase):
                 http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
                 code, _, err = self.run_main(argv, http)
                 self.assertEqual((code, err, http.calls),
-                                 (1, "エラー: 採点対象と同じ手採点を採点例に含めることはできません: ['alias-model']\n", []),
+                                 (1, "エラー: 採点対象と同じ手採点または回答を採点例に含めることはできません: ['alias-model']\n", []),
                                  (link, argv))
+
+    def test_example_reusing_a_target_answer_is_rejected(self):
+        alias = self.root / "results" / "alias-model"
+        alias.mkdir()
+        target = self.root / "results" / self.DIR
+        (alias / "scoring.md").write_text("<!-- 別の採点 -->\n" + (target / "scoring.md").read_text(encoding="utf-8"),
+                                          encoding="utf-8")
+        cases = (("scoring.md", "scoring.md"), ("q1_raw.txt", "q1_raw.txt"), ("q2_raw.txt", "q1_raw.txt"),
+                 ("q3_raw.txt", "q3_raw.txt"))
+        for src, dst in cases:
+            (alias / "scoring.md").write_text("<!-- 別の採点 -->\n" + (target / "scoring.md").read_text(encoding="utf-8"),
+                                              encoding="utf-8")
+            for q in (1, 2, 3):
+                (alias / f"q{q}_raw.txt").write_text(f"別の回答{q}", encoding="utf-8")
+            shutil.copy(target / src, alias / dst)
+            for argv in (["submit", self.DIR], ["submit", "--examples", "alias-model", self.DIR]):
+                http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+                code, _, err = self.run_main(argv, http)
+                self.assertEqual((code, err, http.calls),
+                                 (1, "エラー: 採点対象と同じ手採点または回答を採点例に含めることはできません: ['alias-model']\n", []),
+                                 (src, argv))
+
+    def test_unreadable_example_answer_names_what_failed(self):
+        copy_result_dir(self.root, self.DIR, "other-model")
+        bad = self.root / "results" / "other-model" / "q3_raw.txt"
+        bad.write_bytes(b"\x80\x81")
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        code, _, err = self.run_main(["submit", self.DIR], http)
+        self.assertEqual((code, err), (1, f"エラー: 手採点か回答をUTF-8として読めません: {bad}\n"))
 
     def test_http_error_body_cut_off_is_still_a_clear_error(self):
         body = mock.MagicMock()
