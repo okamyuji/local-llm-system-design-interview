@@ -100,5 +100,24 @@ class CustomIdTest(unittest.TestCase):
             judge.split_custom_id("foo")
 
 
+class BuildRequestTest(unittest.TestCase):
+    def test_builds_batch_request_with_cached_rubric_and_schema(self):
+        req = judge.build_request("m__q1__opus55__r0", "claude-opus-5-5", "RUBRIC", "出題文", "回答本文")
+        self.assertEqual(req["custom_id"], "m__q1__opus55__r0")
+        p = req["params"]
+        self.assertEqual(p["model"], "claude-opus-5-5")
+        self.assertEqual(p["max_tokens"], 4096)
+        self.assertEqual(p["system"][0], {"type": "text", "text": "RUBRIC", "cache_control": {"type": "ephemeral"}})
+        self.assertEqual(p["system"][1], {"type": "text", "text": judge.RULES})
+        self.assertEqual(p["messages"], [{"role": "user", "content": "出題:\n出題文\n\n<answer>\n回答本文\n</answer>"}])
+        self.assertEqual(p["output_config"], {"format": {"type": "json_schema", "schema": judge.SCHEMA}})
+
+    def test_schema_requires_all_fields(self):
+        self.assertEqual(judge.SCHEMA["required"], ["truncated", "criteria"])
+        item = judge.SCHEMA["properties"]["criteria"]["items"]
+        self.assertEqual(item["required"], ["id", "score", "evidence", "reason"])
+        self.assertFalse(item["additionalProperties"])
+
+
 if __name__ == "__main__":
     unittest.main()

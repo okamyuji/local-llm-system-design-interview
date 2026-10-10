@@ -72,3 +72,49 @@ def split_custom_id(cid: str) -> tuple[str, int, str, int]:
     if not m:
         raise JudgeError(f"custom_idの形式が違います: {cid}")
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+
+
+MAX_TOKENS = 4096
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "truncated": {"type": "boolean"},
+        "criteria": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "score": {"type": "integer"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string"},
+                },
+                "required": ["id", "score", "evidence", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["truncated", "criteria"],
+    "additionalProperties": False,
+}
+RULES = """あなたはシステム設計面接の採点者です。上の採点基準だけを使い、回答を観点1〜5で採点してください。
+- 観点ごとに、回答から根拠となる箇所を一字一句そのまま引用し、evidenceに入れてください。要約や言い換えは引用にしないでください。
+- 点数は各観点のレンジの記述に機械的に当てはめ、印象点を加えないでください。
+- reasonには、どのレンジに当てはめたかと、その理由を日本語1〜2文で書いてください。
+- 回答が途中で切れている場合はtruncatedをtrueにし、書かれた範囲で採点してください。"""
+
+
+def build_request(custom_id: str, model: str, rubric: str, question: str, answer: str) -> dict:
+    return {
+        "custom_id": custom_id,
+        "params": {
+            "model": model,
+            "max_tokens": MAX_TOKENS,
+            "system": [
+                {"type": "text", "text": rubric, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": RULES},
+            ],
+            "messages": [{"role": "user", "content": f"出題:\n{question}\n\n<answer>\n{answer}\n</answer>"}],
+            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+        },
+    }
