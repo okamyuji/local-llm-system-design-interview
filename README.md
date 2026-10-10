@@ -1,6 +1,6 @@
 # local-llm-system-design-interview
 
-ローカルLLMにシステム設計面接の問題を解かせ、固定の採点基準で採点する実測リポジトリです。出題、採点基準、実行スクリプト、各モデルの回答全文と採点根拠をすべて収録しており、手元のマシンで同じ計測を再現できます。
+ローカルLLMにシステム設計面接の問題を解かせ、固定の採点基準で採点する実測リポジトリです。出題、採点基準、実行スクリプト、各モデルの回答全文と採点根拠をすべて収録しているので、読者が自分のマシンで同じ計測を再現できます。
 
 ## 収録内容
 
@@ -84,10 +84,14 @@ python3 scripts/judge.py collect <batch ID>
 
 バッチの処理には最長24時間かかります。`collect`は処理中なら状況を表示して終了コード2で終わるので、時間をおいて再実行してください。判定の生データは`judge-out/<batch ID>/`に保存されます。
 
-手採点と判定の一致を確かめるときは、複数のモデルと回数でまとめて採点し、`calibrate`で比べます。
+採点の水準を手採点に合わせるため、手採点済みのほかのモデルの`scoring.md`を採点例として渡します。`--examples`を省くと、採点対象以外の手採点がすべて採点例になります。採点対象を採点例に含めることはできません。
+
+手採点と判定の一致を確かめるときは、手採点済みの回答を採点例と採点対象に分け、同じ回答を複数回採点してから`calibrate`で比べてください。
 
 ```bash
-python3 scripts/judge.py submit --model claude-opus-5-5 --model claude-sonnet-5-5 --runs 3
+python3 scripts/judge.py submit --model claude-opus-5-5 --runs 3 \
+  --examples gemma4-e4b --examples gemma4-e4b-tools --examples qwen35-9b --examples qwen35-9b-tools \
+  qwen25-coder-14b qwen25-coder-14b-tools shisa-v2-12b shisa-v2-12b-tools
 python3 scripts/judge.py collect <batch ID>
 python3 scripts/judge.py calibrate <batch ID>
 ```

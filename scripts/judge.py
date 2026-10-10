@@ -112,16 +112,17 @@ RULES = """あなたはシステム設計面接の採点者です。上の採点
 - 回答が途中で切れている場合はtruncatedをtrueにし、書かれた範囲で採点してください。"""
 
 
-def build_request(custom_id: str, model: str, rubric: str, question: str, answer: str) -> dict:
+def build_request(custom_id: str, model: str, rubric: str, question: str, answer: str, examples: str = "") -> dict:
+    system = [{"type": "text", "text": rubric, "cache_control": {"type": "ephemeral"}}]
+    if examples:
+        system.append({"type": "text", "text": examples, "cache_control": {"type": "ephemeral"}})
+    system.append({"type": "text", "text": RULES})
     return {
         "custom_id": custom_id,
         "params": {
             "model": model,
             "max_tokens": MAX_TOKENS,
-            "system": [
-                {"type": "text", "text": rubric, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": RULES},
-            ],
+            "system": system,
             "messages": [{"role": "user", "content": f"出題:\n{question}\n\n<answer>\n{answer}\n</answer>"}],
             "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
         },
@@ -130,6 +131,11 @@ def build_request(custom_id: str, model: str, rubric: str, question: str, answer
 
 def normalize_ws(text: str) -> str:
     return " ".join(text.split())
+
+
+def normalize_quote(text: str) -> str:
+    # 判定モデルはMarkdownの強調やコード記号を外して引用し、引用全体を「」で囲むことがある
+    return normalize_ws(text.replace("**", "").replace("`", "")).strip("「」")
 
 
 def check_schema(obj) -> str | None:
@@ -148,9 +154,9 @@ def check_schema(obj) -> str | None:
 
 
 def find_fabricated(obj: dict, answer: str) -> list[str]:
-    haystack = normalize_ws(answer)
+    haystack = normalize_quote(answer)
     quotes = [q for c in obj["criteria"] for q in c.get("evidence", [])]
-    return [q for q in quotes if normalize_ws(q) and normalize_ws(q) not in haystack]
+    return [q for q in quotes if normalize_quote(q) and normalize_quote(q) not in haystack]
 
 
 def validate_judgment(text: str, answer: str) -> tuple[dict | None, str | None, list[str]]:
@@ -203,7 +209,7 @@ def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
     if m["mae"] > PASS_MAE:
         reasons.append(f"平均絶対誤差が{PASS_MAE}点超")
     if m["total_within"] < PASS_TOTAL:
-        reasons.append("合計差5点以内の回答が24回答中20未満")
+        reasons.append(f"合計差{TOTAL_TOLERANCE}点以内の回答が{PASS_TOTAL:.0%}未満")
     if stable < PASS_STABLE:
         reasons.append(f"採点ごとの幅2点以内が{PASS_STABLE:.0%}未満")
     if fabricated:
@@ -305,6 +311,29 @@ def scores_of(rec: dict) -> list[int]:
     return [c["score"] for c in sorted(rec["judgment"]["criteria"], key=lambda c: c["id"])]
 
 
+def read_hand_scoring(root: Path, dir_name: str) -> str:
+    path = root / "results" / dir_name / "scoring.md"
+    if not path.exists():
+        raise JudgeError(f"手採点がありません: {path}")
+    return path.read_text()
+
+
+def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list[str]:
+    if chosen is None:
+        return [d for d in list_dirs(root) if d not in dirs and (root / "results" / d / "scoring.md").exists()]
+    overlap = sorted(set(chosen) & set(dirs))
+    if overlap:
+        raise JudgeError(f"採点対象を採点例に含めることはできません: {overlap}")
+    return chosen
+
+
+def load_examples(root: Path, dirs: list[str]) -> str:
+    if not dirs:
+        return ""
+    blocks = [f'<example dir="{d}">\n{read_hand_scoring(root, d)}\n</example>' for d in dirs]
+    return "次は手採点の採点例です。採点の水準をこの例に合わせてください。\n\n" + "\n\n".join(blocks)
+
+
 def cmd_submit(args, root: Path, key: str, http) -> int:
     rubric = (root / "rubric.md").read_text()
     questions = parse_questions((root / "questions.md").read_text())
@@ -313,7 +342,8 @@ def cmd_submit(args, root: Path, key: str, http) -> int:
     ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
            for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
     answers = load_answers(root, dirs)
-    requests = [build_request(cid, m, rubric, questions[q][1], answers[(d, q)]) for cid, m, d, q in ids]
+    examples = load_examples(root, pick_examples(root, dirs, args.examples))
+    requests = [build_request(cid, m, rubric, questions[q][1], answers[(d, q)], examples) for cid, m, d, q in ids]
     batch_id = create_batch(requests, key, http)
     print(f"{batch_id} を作成しました（{len(requests)}件）。終わったら collect {batch_id} を実行してください。")
     return 0
@@ -351,13 +381,7 @@ def write_drafts(root: Path, batch_id: str, records: list[dict]) -> None:
 
 
 def load_hand(root: Path, dirs: list[str]) -> dict[tuple[str, int], list[int]]:
-    hand = {}
-    for d in dirs:
-        path = root / "results" / d / "scoring.md"
-        if not path.exists():
-            raise JudgeError(f"手採点がありません: {path}")
-        hand.update({(d, q): s for q, s in parse_hand_scores(path.read_text()).items()})
-    return hand
+    return {(d, q): s for d in dirs for q, s in parse_hand_scores(read_hand_scoring(root, d)).items()}
 
 
 def cmd_calibrate(args, root: Path) -> int:
@@ -401,6 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("submit", help="回答をまとめて1つのバッチに送る")
     s.add_argument("--model", action="append", choices=sorted(MODEL_SHORT), help=f"判定モデル（既定 {DEFAULT_MODEL}、複数指定可）")
+    s.add_argument("--examples", action="append", help="採点例にする手採点済みディレクトリ（省略時は対象以外の手採点すべて、複数指定可）")
     s.add_argument("--runs", type=positive_int, default=1, help="同じ回答を採点する回数")
     s.add_argument("dirs", nargs="*", help="results/配下の対象ディレクトリ（省略時は全部）")
     for name, text in (("collect", "終わったバッチの結果を保存し、下書きを書く"), ("calibrate", "手採点と比べて合否を出す")):

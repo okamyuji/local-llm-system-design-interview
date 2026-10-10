@@ -483,7 +483,7 @@ class EdgeInputTest(unittest.TestCase):
     def test_verdict_reasons_are_exact(self):
         m = {"band_agree": 0.5, "mae": 2.0, "bias": 2.0, "total_within": 0.5}
         self.assertEqual(judge.verdict(m, 0.5, 1), [
-            "レンジ一致が80%未満", "平均絶対誤差が1.5点超", "合計差5点以内の回答が24回答中20未満",
+            "レンジ一致が80%未満", "平均絶対誤差が1.5点超", "合計差5点以内の回答が83%未満",
             "採点ごとの幅2点以内が90%未満", "引用の捏造が1件", "偏りが±1.5点超"])
 
 
@@ -588,7 +588,7 @@ class CliDetailTest(unittest.TestCase):
         path.write_text(json.dumps({**rec, "fabricated": ["x"]}, ensure_ascii=False))
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(out, (
-            "sonnet55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が24回答中20未満、引用の捏造が1件、偏りが±1.5点超）\n"
+            "sonnet55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が83%未満、引用の捏造が1件、偏りが±1.5点超）\n"
             "  レンジ一致 66.7% / 平均絶対誤差 1.87 / 偏り +1.87 / 合計差5点以内 66.7% / 1回の幅2点以内 100.0% / 捏造 1件\n"))
 
     def test_missing_key_message_is_exact(self):
@@ -616,7 +616,83 @@ class CliDetailTest(unittest.TestCase):
         self.assertIn("{claude-opus-5-5,claude-sonnet-5-5}", out)
         self.assertRegex(out, r"\s判定モデル（既定 claude-sonnet-5-5、複数指定可）\n")
         self.assertRegex(out, r"--runs RUNS\s+同じ回答を採点する回数\n")
+        self.assertRegex(out, r"\s採点例にする手採点済みディレクトリ（省略時は対象以外の手採点すべて、複数指定可）\n")
         self.assertRegex(out, r"dirs\s+results/配下の対象ディレクトリ（省略時は全部）\n")
+
+
+class ExamplesAndMarkupTest(unittest.TestCase):
+    def test_markdown_emphasis_backticks_and_outer_brackets_are_not_fabrication(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["「ロードバランシング: NGINXで分散」", "Redisの INCR"])
+        self.assertEqual(judge.find_fabricated(obj, "**ロードバランシング**: NGINXで分散する。`Redis`の `INCR`"), [])
+
+    def test_elided_quote_is_still_fabrication(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["ロードバランシング (…) 分散"])
+        self.assertEqual(len(judge.find_fabricated(obj, "**ロードバランシング**: NGINXで分散する。")), 5)
+
+    def test_build_request_puts_cached_examples_between_rubric_and_rules(self):
+        system = judge.build_request("m__q1__opus55__r0", "claude-opus-5-5", "RUBRIC", "Q", "A", "EX")["params"]["system"]
+        self.assertEqual(system, [
+            {"type": "text", "text": "RUBRIC", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "EX", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": judge.RULES},
+        ])
+
+    def test_load_examples_wraps_each_hand_scoring(self):
+        text = judge.load_examples(ROOT, ["qwen35-9b"])
+        scoring = (ROOT / "results" / "qwen35-9b" / "scoring.md").read_text()
+        self.assertTrue(text.startswith("次は手採点の採点例です。採点の水準をこの例に合わせてください。\n\n"))
+        self.assertIn(f'<example dir="qwen35-9b">\n{scoring}\n</example>', text)
+        self.assertEqual(judge.load_examples(ROOT, []), "")
+
+    def test_load_examples_separates_examples_with_blank_line(self):
+        text = judge.load_examples(ROOT, ["qwen35-9b", "gemma4-e4b"])
+        self.assertIn("\n</example>\n\n<example dir=\"gemma4-e4b\">\n", text)
+
+    def test_only_outer_corner_brackets_are_stripped(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["X社"])
+        self.assertEqual(judge.find_fabricated(obj, "社のX"), ["X社"] * 5)
+
+    def test_load_examples_requires_hand_scoring(self):
+        with self.assertRaisesRegex(judge.JudgeError, "手採点がありません"):
+            judge.load_examples(ROOT, ["no-such-dir"])
+
+
+class SubmitExamplesTest(unittest.TestCase):
+    DIR = CliTest.DIR
+    setUp = CliTest.setUp
+    run_main = CliTest.run_main
+
+    def add_other_dir(self):
+        shutil.copytree(self.root / "results" / self.DIR, self.root / "results" / "other-model")
+
+    def submit(self, argv):
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        code, _, err = self.run_main(argv, http)
+        return code, err, http
+
+    def test_default_examples_are_hand_scored_dirs_other_than_targets(self):
+        self.add_other_dir()
+        code, _, http = self.submit(["submit", self.DIR])
+        self.assertEqual(code, 0)
+        examples = http.calls[0][2]["requests"][0]["params"]["system"][1]["text"]
+        self.assertIn('<example dir="other-model">', examples)
+        self.assertNotIn(f'<example dir="{self.DIR}">', examples)
+
+    def test_no_examples_block_when_nothing_else_is_hand_scored(self):
+        code, _, http = self.submit(["submit", self.DIR])
+        self.assertEqual(len(http.calls[0][2]["requests"][0]["params"]["system"]), 2)
+
+    def test_explicit_examples_overlapping_targets_are_rejected_without_sending(self):
+        code, err, http = self.submit(["submit", "--examples", self.DIR, self.DIR])
+        self.assertEqual(code, 1)
+        self.assertEqual(err, f"エラー: 採点対象を採点例に含めることはできません: ['{self.DIR}']\n")
+        self.assertEqual(http.calls, [])
+
+    def test_explicit_examples_are_used(self):
+        self.add_other_dir()
+        code, _, http = self.submit(["submit", "--examples", "other-model", self.DIR])
+        self.assertEqual(code, 0)
+        self.assertIn('<example dir="other-model">', http.calls[0][2]["requests"][0]["params"]["system"][1]["text"])
 
 
 if __name__ == "__main__":
