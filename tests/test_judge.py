@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import re
 import shutil
 import sys
 import tempfile
@@ -226,6 +228,7 @@ def fake_http(responses):
     calls = []
 
     def http(method, url, key, body=None):
+        assert key == KEY, key
         calls.append((method, url, body))
         return responses[(method, url)]
 
@@ -345,6 +348,9 @@ class CliTest(unittest.TestCase):
             shutil.copy(ROOT / name, self.root / name)
         shutil.copytree(ROOT / "results" / self.DIR, self.root / "results" / self.DIR)
         self.env = {"ANTHROPIC_API_KEY": KEY}
+        blocker = mock.patch("urllib.request.urlopen", side_effect=AssertionError("テストから実APIへ通信しようとした"))
+        blocker.start()
+        self.addCleanup(blocker.stop)
 
     def run_main(self, argv, http=None, env=None):
         out, err = io.StringIO(), io.StringIO()
@@ -352,15 +358,19 @@ class CliTest(unittest.TestCase):
             code = judge.main(argv, root=self.root, http=http or fake_http({}), env=self.env if env is None else env)
         return code, out.getvalue(), err.getvalue()
 
-    def ended_batch_http(self, batch_id="msgbatch_01abc"):
+    def ended_http(self, qs=(1, 2, 3), errored=(), scores=None):
         hand = judge.parse_hand_scores((self.root / "results" / self.DIR / "scoring.md").read_text())
         lines = []
-        for q, scores in hand.items():
+        for q in qs:
+            cid = f"{self.DIR}__q{q}__sonnet55__r0"
+            if q in errored:
+                lines.append(json.dumps({"custom_id": cid, "result": {"type": "errored", "error": {}}}))
+                continue
             answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
-            judgment = make_judgment(scores, [answer.strip()[:10]])
-            lines.append(json.dumps(succeeded(f"{self.DIR}__q{q}__sonnet55__r0", judgment), ensure_ascii=False))
+            judgment = make_judgment((scores or {}).get(q, hand[q]), [answer.strip()[:10]])
+            lines.append(json.dumps(succeeded(cid, judgment), ensure_ascii=False))
         return fake_http({
-            ("GET", f"{judge.API}/{batch_id}"): json.dumps({"processing_status": "ended", "results_url": "https://r", "request_counts": {}}).encode(),
+            ("GET", f"{judge.API}/msgbatch_01abc"): b'{"processing_status": "ended", "results_url": "https://r", "request_counts": {}}',
             ("GET", "https://r"): "\n".join(lines).encode(),
         })
 
@@ -403,7 +413,7 @@ class CliTest(unittest.TestCase):
     def test_collect_saves_records_and_writes_draft_without_touching_hand_scores(self):
         scoring = self.root / "results" / self.DIR / "scoring.md"
         before = scoring.read_bytes()
-        code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
         self.assertEqual(code, 0)
         self.assertEqual(len(list((self.root / "judge-out" / "msgbatch_01abc").glob("*.json"))), 3)
         draft = (self.root / "results" / self.DIR / "scoring.judge.md").read_text()
@@ -417,20 +427,20 @@ class CliTest(unittest.TestCase):
         self.assertIn("batch ID", err)
 
     def test_calibrate_passes_when_judge_matches_hand_scores(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
         self.assertIn("sonnet55: 合格", out)
 
     def test_calibrate_reports_undecidable_when_a_judgment_is_missing(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
         (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__sonnet55__r0.json").unlink()
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
-        self.assertIn("sonnet55: 判定不能", out)
+        self.assertIn("sonnet55: 判定不能（判定が欠けた回答 1件）\n", out)
 
     def test_calibrate_fails_clearly_without_hand_scores(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
         (self.root / "results" / self.DIR / "scoring.md").unlink()
         code, _, err = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 1)
@@ -440,6 +450,173 @@ class CliTest(unittest.TestCase):
         code, _, err = self.run_main(["calibrate", "msgbatch_01zzz"])
         self.assertEqual(code, 1)
         self.assertIn("collect", err)
+
+
+class EdgeInputTest(unittest.TestCase):
+    def test_last_criterion_at_end_of_text_without_newline(self):
+        text = "## Q1 題: 15/50\n\n" + "\n".join(f"- 観点{i}・x: {i}点" for i in range(1, 6))
+        self.assertEqual(judge.parse_hand_scores(text), {1: [1, 2, 3, 4, 5]})
+
+    def test_parse_error_message_is_exact(self):
+        with self.assertRaises(judge.JudgeError) as cm:
+            judge.parse_hand_scores("# 空\n")
+        self.assertEqual(str(cm.exception), "採点の見出し（## Q<n> ...: <点>/50）がありません")
+
+    def test_normalize_ws_collapses_runs_to_one_space(self):
+        self.assertEqual(judge.normalize_ws(" a \n\t b  c "), "a b c")
+
+    def test_schema_messages_are_exact_and_non_dict_criteria_do_not_crash(self):
+        self.assertEqual(judge.check_schema([]), "criteriaがありません")
+        self.assertEqual(judge.check_schema({"criteria": [1, 2, 3, 4, 5]}),
+                         "観点の重複か欠落があります: [None, None, None, None, None]")
+
+    def test_criterion_without_evidence_has_no_fabricated_quotes(self):
+        obj = make_judgment([1, 2, 3, 4, 5])
+        del obj["criteria"][0]["evidence"]
+        self.assertEqual(judge.find_fabricated(obj, "x"), [])
+
+    def test_validation_messages_are_exact(self):
+        self.assertEqual(judge.validate_judgment("{", "a")[1], "JSONとして読めません")
+        bad = json.dumps(make_judgment([1, 2, 3, 4, 5], ["ない"]))
+        self.assertEqual(judge.validate_judgment(bad, "a")[1], "引用が回答本文にありません")
+
+    def test_verdict_reasons_are_exact(self):
+        m = {"band_agree": 0.5, "mae": 2.0, "bias": 2.0, "total_within": 0.5}
+        self.assertEqual(judge.verdict(m, 0.5, 1), [
+            "レンジ一致が80%未満", "平均絶対誤差が1.5点超", "合計差5点以内の回答が24回答中20未満",
+            "採点ごとの幅2点以内が90%未満", "引用の捏造が1件", "偏りが±1.5点超"])
+
+
+class HttpDetailTest(unittest.TestCase):
+    def test_get_sends_no_body_with_json_header_and_60s_timeout(self):
+        res = mock.MagicMock()
+        res.__enter__.return_value.read.return_value = b"{}"
+        with mock.patch("urllib.request.urlopen", return_value=res) as urlopen:
+            judge.http_request("GET", judge.API, KEY)
+        req = urlopen.call_args.args[0]
+        self.assertIsNone(req.data)
+        self.assertEqual(req.get_method(), "GET")
+        self.assertEqual(req.get_header("Content-type"), "application/json")
+        self.assertEqual(urlopen.call_args.kwargs, {"timeout": 60})
+
+    def test_undecodable_error_body_is_replaced_not_raised(self):
+        err = urllib.error.HTTPError(judge.API, 500, "x", {}, mock.Mock(read=lambda: b"\xff"))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaisesRegex(judge.JudgeError, "^HTTP 500: �$"):
+                judge.http_request("GET", judge.API, KEY)
+
+
+class ClassifyDetailTest(unittest.TestCase):
+    ANSWERS = {("m", 1): "二重販売を防ぐ。"}
+
+    def test_joins_text_blocks_and_skips_others(self):
+        payload = json.dumps(make_judgment([1, 2, 3, 4, 5]))
+        content = [{"type": "text"}, {"type": "text", "text": payload[:10]}, {"type": "tool_use"},
+                   {"type": "text", "text": payload[10:]}]
+        result = {"custom_id": "m__q1__opus55__r0", "result": {"type": "succeeded", "message": {"content": content}}}
+        self.assertEqual(judge.classify(result, self.ANSWERS)["status"], "ok")
+
+    def test_invalid_record_keeps_error_text(self):
+        rec = judge.classify(succeeded("m__q1__opus55__r0", "{"), self.ANSWERS)
+        self.assertEqual(rec["error"], "JSONとして読めません")
+
+
+class RenderLayoutTest(unittest.TestCase):
+    def test_exact_layout(self):
+        records = {1: {"status": "ok", "judgment": make_judgment([1, 2, 3, 4, 5], ["甲", "乙"], True)},
+                   2: {"status": "errored"}}
+        text = judge.render_scoring("m", "M", "msgbatch_01abc", TITLES, NAMES, records)
+        items = "".join(f"- 観点{i}・{NAMES[i - 1]}: {i}点。r「甲」「乙」\n" for i in range(1, 6))
+        self.assertEqual(text, (
+            "# m 自動採点の下書き\n\n"
+            "判定モデルはM、batch IDはmsgbatch_01abcです。人が回答と照合してから`scoring.md`へ反映してください。\n\n"
+            "## Q1 題1: 15/50\n\n回答は途中で切れていると判定しました。\n\n" + items +
+            "\n## Q2 題2: 判定なし（errored）\n\n## Q3 題3: 判定なし（missing）\n"))
+
+
+class CliDetailTest(unittest.TestCase):
+    DIR = CliTest.DIR
+    setUp = CliTest.setUp
+    run_main = CliTest.run_main
+    ended_http = CliTest.ended_http
+
+    def run_exit(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch.dict(os.environ, {"COLUMNS": "200"}), self.assertRaises(SystemExit) as cm:
+            judge.main(argv, root=self.root, http=fake_http({}), env=self.env)
+        return cm.exception.code, out.getvalue(), err.getvalue()
+
+    def test_submit_sends_rubric_question_and_answer_for_each_question(self):
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        self.run_main(["submit", "--runs", "1"], http)
+        reqs = http.calls[0][2]["requests"]
+        self.assertEqual([r["custom_id"] for r in reqs], [f"{self.DIR}__q{q}__sonnet55__r0" for q in (1, 2, 3)])
+        rubric = (self.root / "rubric.md").read_text()
+        questions = judge.parse_questions((self.root / "questions.md").read_text())
+        for q, r in zip((1, 2, 3), reqs):
+            answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
+            self.assertEqual(r["params"]["system"][0]["text"], rubric)
+            self.assertEqual(r["params"]["messages"][0]["content"], f"出題:\n{questions[q][1]}\n\n<answer>\n{answer}\n</answer>")
+
+    def test_collect_can_run_twice_and_saves_readable_json(self):
+        for _ in range(2):
+            code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
+            self.assertEqual(code, 0)
+        self.assertIn("judge-out", os.listdir(self.root))
+        saved = (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q1__sonnet55__r0.json").read_text()
+        self.assertEqual(saved, json.dumps(json.loads(saved), ensure_ascii=False, indent=2))
+        draft_dir = self.root / "results" / self.DIR
+        self.assertIn("scoring.judge.md", os.listdir(draft_dir))
+        self.assertIn(f"下書きを書きました: {draft_dir / 'scoring.judge.md'}\n", out)
+
+    def test_collect_reports_mixed_statuses_and_marks_errored_question(self):
+        code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http(errored=(2,)))
+        self.assertIn("errored 1 / ok 2（保存先 ", out)
+        draft = (self.root / "results" / self.DIR / "scoring.judge.md").read_text()
+        self.assertTrue(draft.startswith(f"# {self.DIR} 自動採点の下書き\n\n判定モデルはclaude-sonnet-5-5、batch IDはmsgbatch_01abcです。"))
+        self.assertIn("判定なし（errored）", draft)
+
+    def test_collect_handles_single_result(self):
+        code, _, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http(qs=(1,)))
+        self.assertEqual(code, 0)
+
+    def test_calibrate_reports_every_failed_condition(self):
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(scores={1: [10, 10, 10, 10, 10]}))
+        path = self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__sonnet55__r0.json"
+        rec = json.loads(path.read_text())
+        path.write_text(json.dumps({**rec, "fabricated": ["x"]}, ensure_ascii=False))
+        code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(out, (
+            "sonnet55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が24回答中20未満、引用の捏造が1件、偏りが±1.5点超）\n"
+            "  レンジ一致 66.7% / 平均絶対誤差 1.87 / 偏り +1.87 / 合計差5点以内 66.7% / 1回の幅2点以内 100.0% / 捏造 1件\n"))
+
+    def test_missing_key_message_is_exact(self):
+        _, _, err = self.run_main(["collect", "msgbatch_01abc"], env={})
+        self.assertEqual(err, "エラー: 環境変数ANTHROPIC_API_KEYを設定してください\n")
+
+    def test_runs_must_be_positive(self):
+        code, _, err = self.run_exit(["submit", "--runs", "0"])
+        self.assertEqual(code, 2)
+        self.assertTrue(err.endswith("argument --runs: 1以上を指定してください\n"), err)
+
+    def test_subcommand_is_required(self):
+        self.assertEqual(self.run_exit([])[0], 2)
+
+    def test_unknown_model_is_rejected(self):
+        self.assertEqual(self.run_exit(["submit", "--model", "gpt"])[0], 2)
+
+    def test_help_texts(self):
+        _, out, _ = self.run_exit(["--help"])
+        self.assertIn("\nrubric.mdで回答を採点した下書きを、Message Batches APIで作ります。\n", out)
+        for name, text in (("submit", "回答をまとめて1つのバッチに送る"), ("collect", "終わったバッチの結果を保存し、下書きを書く"),
+                           ("calibrate", "手採点と比べて合否を出す")):
+            self.assertRegex(out, rf"(?m)^\s+{name}\s+{text}$")
+        _, out, _ = self.run_exit(["submit", "--help"])
+        self.assertIn("{claude-opus-5-5,claude-sonnet-5-5}", out)
+        self.assertRegex(out, r"\s判定モデル（既定 claude-sonnet-5-5、複数指定可）\n")
+        self.assertRegex(out, r"--runs RUNS\s+同じ回答を採点する回数\n")
+        self.assertRegex(out, r"dirs\s+results/配下の対象ディレクトリ（省略時は全部）\n")
 
 
 if __name__ == "__main__":
