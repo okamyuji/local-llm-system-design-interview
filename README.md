@@ -72,6 +72,26 @@ AGENT_BIN=... AGENT_WS=... bash scripts/run_model.sh results/my-model llamacpp/g
 
 `rubric.md`の5基準へ機械的に当てはめます。採点は回答を見る前に固定した基準で行い、基準ごとに回答から根拠を引用して`results/<モデル名>/scoring.md`へ残します。
 
+### 5. 自動採点の下書きを作る（任意）
+
+`scripts/judge.py`は、`rubric.md`の5観点で回答を採点した下書きを、AnthropicのMessage Batches APIで作ります。下書きは`results/<モデル名>/scoring.judge.md`に書かれ、`scoring.md`は変更しません。下書きは必ず人が回答と照合してから`scoring.md`へ反映してください。
+
+```bash
+export ANTHROPIC_API_KEY=...            # Claude ConsoleのAPIキー
+python3 scripts/judge.py submit my-model # 対象ディレクトリを省くとresults/配下すべて
+python3 scripts/judge.py collect <batch ID>
+```
+
+バッチの処理には最長24時間かかります。`collect`は処理中なら状況を表示して終了コード2で終わるので、時間をおいて再実行してください。判定の生データは`judge-out/<batch ID>/`に保存されます。
+
+手採点と判定の一致を確かめるときは、複数のモデルと回数でまとめて採点し、`calibrate`で比べます。
+
+```bash
+python3 scripts/judge.py submit --model claude-opus-5-5 --model claude-sonnet-5-5 --runs 3
+python3 scripts/judge.py collect <batch ID>
+python3 scripts/judge.py calibrate <batch ID>
+```
+
 ## 計測条件の注意
 
 - 各問は独立したプロセスの1ショット実行で、会話履歴を持ち越しません

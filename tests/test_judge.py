@@ -335,5 +335,112 @@ class RenderScoringTest(unittest.TestCase):
         self.assertNotIn("合計", text)
 
 
+class CliTest(unittest.TestCase):
+    DIR = "qwen35-9b"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        for name in ("rubric.md", "questions.md"):
+            shutil.copy(ROOT / name, self.root / name)
+        shutil.copytree(ROOT / "results" / self.DIR, self.root / "results" / self.DIR)
+        self.env = {"ANTHROPIC_API_KEY": KEY}
+
+    def run_main(self, argv, http=None, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = judge.main(argv, root=self.root, http=http or fake_http({}), env=self.env if env is None else env)
+        return code, out.getvalue(), err.getvalue()
+
+    def ended_batch_http(self, batch_id="msgbatch_01abc"):
+        hand = judge.parse_hand_scores((self.root / "results" / self.DIR / "scoring.md").read_text())
+        lines = []
+        for q, scores in hand.items():
+            answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
+            judgment = make_judgment(scores, [answer.strip()[:10]])
+            lines.append(json.dumps(succeeded(f"{self.DIR}__q{q}__sonnet55__r0", judgment), ensure_ascii=False))
+        return fake_http({
+            ("GET", f"{judge.API}/{batch_id}"): json.dumps({"processing_status": "ended", "results_url": "https://r", "request_counts": {}}).encode(),
+            ("GET", "https://r"): "\n".join(lines).encode(),
+        })
+
+    def test_submit_requires_api_key(self):
+        code, _, err = self.run_main(["submit"], env={})
+        self.assertEqual(code, 1)
+        self.assertIn("ANTHROPIC_API_KEY", err)
+
+    def test_submit_builds_one_request_per_answer_model_and_run(self):
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        code, out, _ = self.run_main(["submit", "--model", "claude-opus-5-5", "--model", "claude-sonnet-5-5", "--runs", "2"], http)
+        self.assertEqual(code, 0)
+        self.assertIn("msgbatch_01abc", out)
+        ids = [r["custom_id"] for r in http.calls[0][2]["requests"]]
+        self.assertEqual(len(ids), 12)
+        self.assertIn("qwen35-9b__q3__opus55__r1", ids)
+
+    def test_submit_defaults_to_one_run_of_default_model(self):
+        http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+        self.run_main(["submit"], http)
+        reqs = http.calls[0][2]["requests"]
+        self.assertEqual({r["params"]["model"] for r in reqs}, {judge.DEFAULT_MODEL})
+        self.assertEqual(len(reqs), 3)
+
+    def test_submit_rejects_bad_dir_without_sending(self):
+        bad = self.root / "results" / "bad_dir"
+        shutil.copytree(self.root / "results" / self.DIR, bad)
+        http = fake_http({})
+        code, _, err = self.run_main(["submit"], http)
+        self.assertEqual(code, 1)
+        self.assertIn("bad_dir", err)
+        self.assertEqual(http.calls, [])
+
+    def test_collect_exits_2_while_processing(self):
+        http = fake_http({("GET", f"{judge.API}/msgbatch_01abc"): b'{"processing_status": "in_progress", "request_counts": {"processing": 3}}'})
+        code, out, _ = self.run_main(["collect", "msgbatch_01abc"], http)
+        self.assertEqual(code, 2)
+        self.assertIn("in_progress", out)
+
+    def test_collect_saves_records_and_writes_draft_without_touching_hand_scores(self):
+        scoring = self.root / "results" / self.DIR / "scoring.md"
+        before = scoring.read_bytes()
+        code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(list((self.root / "judge-out" / "msgbatch_01abc").glob("*.json"))), 3)
+        draft = (self.root / "results" / self.DIR / "scoring.judge.md").read_text()
+        self.assertEqual(judge.parse_hand_scores(draft), judge.parse_hand_scores(before.decode()))
+        self.assertEqual(scoring.read_bytes(), before)
+        self.assertIn("ok 3", out)
+
+    def test_collect_rejects_path_like_batch_id(self):
+        code, _, err = self.run_main(["collect", "../x"])
+        self.assertEqual(code, 1)
+        self.assertIn("batch ID", err)
+
+    def test_calibrate_passes_when_judge_matches_hand_scores(self):
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(code, 0)
+        self.assertIn("sonnet55: 合格", out)
+
+    def test_calibrate_reports_undecidable_when_a_judgment_is_missing(self):
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__sonnet55__r0.json").unlink()
+        code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(code, 0)
+        self.assertIn("sonnet55: 判定不能", out)
+
+    def test_calibrate_fails_clearly_without_hand_scores(self):
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_batch_http())
+        (self.root / "results" / self.DIR / "scoring.md").unlink()
+        code, _, err = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(code, 1)
+        self.assertIn("scoring.md", err)
+
+    def test_calibrate_fails_clearly_without_collected_records(self):
+        code, _, err = self.run_main(["calibrate", "msgbatch_01zzz"])
+        self.assertEqual(code, 1)
+        self.assertIn("collect", err)
+
+
 if __name__ == "__main__":
     unittest.main()

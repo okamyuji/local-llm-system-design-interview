@@ -2,10 +2,15 @@
 """rubric.mdの5観点で回答を採点した下書きを、Message Batches APIで作る。"""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
+import sys
 import urllib.error
 import urllib.request
+from collections import Counter
+from pathlib import Path
 
 HAND_TOTAL_RE = re.compile(r"^## Q([1-3])\b[^\n]*[:：]\s*(\d+)/50\s*$", re.M)
 HAND_ITEM_RE = re.compile(r"^- 観点([1-5])[^:：\n]*[:：]\s*(\d+)点", re.M)
@@ -281,3 +286,141 @@ def render_scoring(dir_name: str, model: str, batch_id: str, titles: dict[int, s
     if len(totals) == 3:
         lines.append(f"- 合計: {sum(totals)}/150")
     return "\n".join(lines).rstrip() + "\n"
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "claude-sonnet-5-5"
+SHORT_MODEL = {v: k for k, v in MODEL_SHORT.items()}
+
+
+def list_dirs(root: Path) -> list[str]:
+    return sorted(p.parent.name for p in (root / "results").glob("*/q1_raw.txt"))
+
+
+def load_answers(root: Path, dirs: list[str]) -> dict[tuple[str, int], str]:
+    return {(d, q): (root / "results" / d / f"q{q}_raw.txt").read_text() for d in dirs for q in (1, 2, 3)}
+
+
+def scores_of(rec: dict) -> list[int]:
+    return [c["score"] for c in sorted(rec["judgment"]["criteria"], key=lambda c: c["id"])]
+
+
+def cmd_submit(args, root: Path, key: str, http) -> int:
+    rubric = (root / "rubric.md").read_text()
+    questions = parse_questions((root / "questions.md").read_text())
+    dirs = args.dirs or list_dirs(root)
+    models = args.model or [DEFAULT_MODEL]
+    ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
+           for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
+    answers = load_answers(root, dirs)
+    requests = [build_request(cid, m, rubric, questions[q][1], answers[(d, q)]) for cid, m, d, q in ids]
+    batch_id = create_batch(requests, key, http)
+    print(f"{batch_id} を作成しました（{len(requests)}件）。終わったら collect {batch_id} を実行してください。")
+    return 0
+
+
+def cmd_collect(args, root: Path, key: str, http) -> int:
+    batch = get_batch(args.batch_id, key, http)
+    if batch["processing_status"] != "ended":
+        print(f"処理中です（{batch['processing_status']}）: {batch['request_counts']}")
+        return 2
+    results = get_results(batch["results_url"], key, http)
+    dirs = sorted({split_custom_id(r["custom_id"])[0] for r in results})
+    answers = load_answers(root, dirs)
+    records = [classify(r, answers) for r in results]
+    out = root / "judge-out" / args.batch_id
+    out.mkdir(parents=True, exist_ok=True)
+    for rec in records:
+        (out / f"{rec['custom_id']}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2))
+    counts = Counter(rec["status"] for rec in records)
+    print(" / ".join(f"{k} {v}" for k, v in sorted(counts.items())) + f"（保存先 {out}）")
+    if len({(r["model"], r["run"]) for r in records}) == 1:
+        write_drafts(root, args.batch_id, records)
+    return 0
+
+
+def write_drafts(root: Path, batch_id: str, records: list[dict]) -> None:
+    titles = {q: t for q, (t, _) in parse_questions((root / "questions.md").read_text()).items()}
+    names = parse_criteria_names((root / "rubric.md").read_text())
+    model = SHORT_MODEL[records[0]["model"]]
+    for d in sorted({r["dir"] for r in records}):
+        by_q = {r["q"]: r for r in records if r["dir"] == d}
+        path = root / "results" / d / "scoring.judge.md"
+        path.write_text(render_scoring(d, model, batch_id, titles, names, by_q))
+        print(f"下書きを書きました: {path}")
+
+
+def load_hand(root: Path, dirs: list[str]) -> dict[tuple[str, int], list[int]]:
+    hand = {}
+    for d in dirs:
+        path = root / "results" / d / "scoring.md"
+        if not path.exists():
+            raise JudgeError(f"手採点がありません: {path}")
+        hand.update({(d, q): s for q, s in parse_hand_scores(path.read_text()).items()})
+    return hand
+
+
+def cmd_calibrate(args, root: Path) -> int:
+    folder = root / "judge-out" / check_batch_id(args.batch_id)
+    records = [json.loads(p.read_text()) for p in sorted(folder.glob("*.json"))]
+    if not records:
+        raise JudgeError(f"{folder}に判定がありません。先にcollectを実行してください")
+    hand = load_hand(root, sorted({r["dir"] for r in records}))
+    for model in sorted({r["model"] for r in records}):
+        print(calibrate_model(model, hand, [r for r in records if r["model"] == model]))
+    return 0
+
+
+def calibrate_model(model: str, hand: dict, records: list[dict]) -> str:
+    runs: dict[int, dict[tuple[str, int], list[int]]] = {r["run"]: {} for r in records}
+    for r in records:
+        if r["status"] == "ok":
+            runs[r["run"]][(r["dir"], r["q"])] = scores_of(r)
+    missing = sum(1 for run in runs.values() for k in hand if k not in run)
+    if missing or 0 not in runs:
+        return f"{model}: 判定不能（判定が欠けた回答 {missing}件）"
+    m = compare(hand, runs[0])
+    stable = stability([runs[k] for k in sorted(runs)])
+    fabricated = sum(1 for r in records if r.get("fabricated"))
+    reasons = verdict(m, stable, fabricated)
+    head = "合格" if not reasons else "不合格（" + "、".join(reasons) + "）"
+    return (f"{model}: {head}\n"
+            f"  レンジ一致 {m['band_agree']:.1%} / 平均絶対誤差 {m['mae']:.2f} / 偏り {m['bias']:+.2f}"
+            f" / 合計差5点以内 {m['total_within']:.1%} / {len(runs)}回の幅2点以内 {stable:.1%} / 捏造 {fabricated}件")
+
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("1以上を指定してください")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="rubric.mdで回答を採点した下書きを、Message Batches APIで作ります。")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("submit", help="回答をまとめて1つのバッチに送る")
+    s.add_argument("--model", action="append", choices=sorted(MODEL_SHORT), help=f"判定モデル（既定 {DEFAULT_MODEL}、複数指定可）")
+    s.add_argument("--runs", type=positive_int, default=1, help="同じ回答を採点する回数")
+    s.add_argument("dirs", nargs="*", help="results/配下の対象ディレクトリ（省略時は全部）")
+    for name, text in (("collect", "終わったバッチの結果を保存し、下書きを書く"), ("calibrate", "手採点と比べて合否を出す")):
+        sub.add_parser(name, help=text).add_argument("batch_id")
+    return parser
+
+
+def main(argv: list[str] | None = None, root: Path = ROOT, http=http_request, env=os.environ) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.cmd == "calibrate":
+            return cmd_calibrate(args, root)
+        key = env.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise JudgeError("環境変数ANTHROPIC_API_KEYを設定してください")
+        return (cmd_submit if args.cmd == "submit" else cmd_collect)(args, root, key, http)
+    except JudgeError as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
