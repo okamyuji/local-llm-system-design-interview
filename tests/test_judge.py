@@ -119,5 +119,62 @@ class BuildRequestTest(unittest.TestCase):
         self.assertFalse(item["additionalProperties"])
 
 
+def make_judgment(scores, evidence=None, truncated=False):
+    return {
+        "truncated": truncated,
+        "criteria": [
+            {"id": i, "score": s, "evidence": list(evidence or []), "reason": "r"}
+            for i, s in enumerate(scores, start=1)
+        ],
+    }
+
+
+class ValidateJudgmentTest(unittest.TestCase):
+    ANSWER = "冒頭で二重販売を防ぐ。\n座席は  Redisで\n確保する。"
+
+    def check(self, obj):
+        return judge.validate_judgment(json.dumps(obj, ensure_ascii=False), self.ANSWER)
+
+    def test_accepts_valid_judgment_with_boundary_scores(self):
+        obj = make_judgment([0, 10, 5, 5, 5], ["二重販売を防ぐ"])
+        self.assertEqual(self.check(obj), (obj, None, []))
+
+    def test_rejects_broken_json(self):
+        judgment, error, _ = judge.validate_judgment('{"truncated": false, "crit', self.ANSWER)
+        self.assertIsNone(judgment)
+        self.assertIn("JSON", error)
+
+    def test_rejects_non_object(self):
+        self.assertIn("criteria", self.check([1, 2])[1])
+
+    def test_rejects_duplicate_or_missing_criterion(self):
+        obj = make_judgment([1, 2, 3, 4, 5])
+        obj["criteria"][4]["id"] = 4
+        self.assertIn("重複か欠落", self.check(obj)[1])
+        obj["criteria"].pop()
+        self.assertIn("重複か欠落", self.check(obj)[1])
+
+    def test_rejects_out_of_range_and_non_integer_scores(self):
+        for bad in (11, -1, 5.0, True, "5"):
+            obj = make_judgment([1, 2, 3, 4, 5])
+            obj["criteria"][2]["score"] = bad
+            self.assertIn("0〜10の整数", self.check(obj)[1], bad)
+
+    def test_flags_fabricated_quote(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["存在しない文"])
+        judgment, error, fabricated = self.check(obj)
+        self.assertIsNone(judgment)
+        self.assertIn("引用", error)
+        self.assertEqual(fabricated, ["存在しない文"] * 5)
+
+    def test_treats_whitespace_difference_as_match(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["座席は Redisで 確保する。"])
+        self.assertIsNone(self.check(obj)[1])
+
+    def test_ignores_blank_quotes(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["", "  "])
+        self.assertIsNone(self.check(obj)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

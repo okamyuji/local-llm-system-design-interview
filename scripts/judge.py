@@ -2,6 +2,7 @@
 """rubric.mdの5観点で回答を採点した下書きを、Message Batches APIで作る。"""
 from __future__ import annotations
 
+import json
 import re
 
 HAND_TOTAL_RE = re.compile(r"^## Q([1-3])\b[^\n]*[:：]\s*(\d+)/50\s*$", re.M)
@@ -118,3 +119,42 @@ def build_request(custom_id: str, model: str, rubric: str, question: str, answer
             "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
         },
     }
+
+
+def normalize_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def check_schema(obj) -> str | None:
+    if not isinstance(obj, dict) or not isinstance(obj.get("criteria"), list):
+        return "criteriaがありません"
+    criteria = obj["criteria"]
+    ids = [c.get("id") if isinstance(c, dict) else None for c in criteria]
+    if len(criteria) != 5 or set(ids) != {1, 2, 3, 4, 5}:
+        return f"観点の重複か欠落があります: {ids}"
+    for c in criteria:
+        score = c.get("score")
+        # bool は int の派生型なので type で厳密に比べる
+        if type(score) is not int or not 0 <= score <= 10:
+            return f"観点{c['id']}の点数が0〜10の整数ではありません: {score!r}"
+    return None
+
+
+def find_fabricated(obj: dict, answer: str) -> list[str]:
+    haystack = normalize_ws(answer)
+    quotes = [q for c in obj["criteria"] for q in c.get("evidence", [])]
+    return [q for q in quotes if normalize_ws(q) and normalize_ws(q) not in haystack]
+
+
+def validate_judgment(text: str, answer: str) -> tuple[dict | None, str | None, list[str]]:
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "JSONとして読めません", []
+    error = check_schema(obj)
+    if error:
+        return None, error, []
+    fabricated = find_fabricated(obj, answer)
+    if fabricated:
+        return None, "引用が回答本文にありません", fabricated
+    return obj, None, []
