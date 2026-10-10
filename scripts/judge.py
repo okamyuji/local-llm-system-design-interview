@@ -49,3 +49,26 @@ def parse_criteria_names(text: str) -> list[str]:
     if sorted(found) != [1, 2, 3, 4, 5]:
         raise JudgeError(f"rubric.mdから観点名1〜5を読み取れません: {sorted(found)}")
     return [found[i] for i in range(1, 6)]
+
+
+MODEL_SHORT = {"claude-opus-5-5": "opus55", "claude-sonnet-5-5": "sonnet55"}
+DIR_RE = re.compile(r"^[a-zA-Z0-9-]+$")
+CUSTOM_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SPLIT_RE = re.compile(r"([a-zA-Z0-9-]+)__q([1-3])__([a-z0-9]+)__r(\d+)")
+
+
+def make_custom_id(dir_name: str, q: int, model_short: str, run: int) -> str:
+    # "__"を区切りに使うので、ディレクトリ名には下線を許さない
+    if not DIR_RE.match(dir_name):
+        raise JudgeError(f"ディレクトリ名に使えない文字があります（英数字とハイフンだけ）: {dir_name}")
+    cid = f"{dir_name}__q{q}__{model_short}__r{run}"
+    if not CUSTOM_ID_RE.match(cid):
+        raise JudgeError(f"custom_idが64文字を超えます: {cid}")
+    return cid
+
+
+def split_custom_id(cid: str) -> tuple[str, int, str, int]:
+    m = SPLIT_RE.fullmatch(cid)
+    if not m:
+        raise JudgeError(f"custom_idの形式が違います: {cid}")
+    return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))

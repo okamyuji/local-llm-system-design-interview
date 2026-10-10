@@ -78,5 +78,27 @@ class ParseCriteriaNamesTest(unittest.TestCase):
             judge.parse_criteria_names("## 観点1: 名前（10点）\n")
 
 
+class CustomIdTest(unittest.TestCase):
+    def test_round_trips(self):
+        cid = judge.make_custom_id("qwen35-9b-tools", 2, "opus55", 1)
+        self.assertEqual(cid, "qwen35-9b-tools__q2__opus55__r1")
+        self.assertEqual(judge.split_custom_id(cid), ("qwen35-9b-tools", 2, "opus55", 1))
+
+    def test_rejects_underscore_in_dir(self):
+        with self.assertRaisesRegex(judge.JudgeError, "使えない文字"):
+            judge.make_custom_id("bad_dir", 1, "opus55", 0)
+
+    def test_accepts_exactly_64_chars(self):
+        self.assertEqual(len(judge.make_custom_id("a" * 48, 1, "opus55", 0)), 64)
+
+    def test_rejects_65_chars(self):
+        with self.assertRaisesRegex(judge.JudgeError, "64文字"):
+            judge.make_custom_id("a" * 49, 1, "opus55", 0)
+
+    def test_split_rejects_other_shapes(self):
+        with self.assertRaisesRegex(judge.JudgeError, "形式"):
+            judge.split_custom_id("foo")
+
+
 if __name__ == "__main__":
     unittest.main()
