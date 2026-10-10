@@ -257,3 +257,27 @@ def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
     if error:
         return {**rec, "status": "invalid", "error": error, "fabricated": fabricated, "raw": text}
     return {**rec, "status": "ok", "judgment": judgment}
+
+
+def render_scoring(dir_name: str, model: str, batch_id: str, titles: dict[int, str],
+                   names: list[str], records: dict[int, dict]) -> str:
+    lines = [f"# {dir_name} 自動採点の下書き", "",
+             f"判定モデルは{model}、batch IDは{batch_id}です。人が回答と照合してから`scoring.md`へ反映してください。", ""]
+    totals = []
+    for q in (1, 2, 3):
+        rec = records.get(q, {"status": "missing"})
+        if rec["status"] != "ok":
+            lines += [f"## Q{q} {titles[q]}: 判定なし（{rec['status']}）", ""]
+            continue
+        criteria = sorted(rec["judgment"]["criteria"], key=lambda c: c["id"])
+        totals.append(sum(c["score"] for c in criteria))
+        lines += [f"## Q{q} {titles[q]}: {totals[-1]}/50", ""]
+        if rec["judgment"]["truncated"]:
+            lines += ["回答は途中で切れていると判定しました。", ""]
+        for c in criteria:
+            quotes = "".join(f"「{e}」" for e in c["evidence"])
+            lines.append(f"- 観点{c['id']}・{names[c['id'] - 1]}: {c['score']}点。{c['reason']}{quotes}")
+        lines.append("")
+    if len(totals) == 3:
+        lines.append(f"- 合計: {sum(totals)}/150")
+    return "\n".join(lines).rstrip() + "\n"

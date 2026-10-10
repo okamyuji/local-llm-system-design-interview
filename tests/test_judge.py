@@ -304,5 +304,36 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(rec["raw"], '{"truncated": fal')
 
 
+NAMES = ["壊してはいけない条件", "構成要素の選定", "主要フローの具体化", "異常系の想定", "スケールの議論"]
+TITLES = {1: "題1", 2: "題2", 3: "題3"}
+
+
+def ok_record(scores, truncated=False):
+    return {"status": "ok", "judgment": make_judgment(scores, ["引用"], truncated)}
+
+
+class RenderScoringTest(unittest.TestCase):
+    def test_output_parses_back_with_hand_score_parser(self):
+        records = {1: ok_record([1, 2, 3, 4, 5]), 2: ok_record([6, 7, 8, 9, 10]), 3: ok_record([0, 0, 0, 0, 1])}
+        text = judge.render_scoring("m", "claude-opus-5-5", "msgbatch_01abc", TITLES, NAMES, records)
+        self.assertEqual(judge.parse_hand_scores(text), {1: [1, 2, 3, 4, 5], 2: [6, 7, 8, 9, 10], 3: [0, 0, 0, 0, 1]})
+        self.assertIn("claude-opus-5-5", text)
+        self.assertIn("msgbatch_01abc", text)
+        self.assertIn("- 観点1・壊してはいけない条件: 1点。r「引用」", text)
+        self.assertIn("- 合計: 56/150", text)
+
+    def test_notes_truncated_answer(self):
+        records = {q: ok_record([1, 1, 1, 1, 1], truncated=(q == 2)) for q in (1, 2, 3)}
+        text = judge.render_scoring("m", "claude-opus-5-5", "msgbatch_01abc", TITLES, NAMES, records)
+        self.assertEqual(text.count("途中で切れている"), 1)
+
+    def test_marks_missing_question_and_omits_total(self):
+        records = {1: ok_record([1, 1, 1, 1, 1]), 2: {"status": "errored"}}
+        text = judge.render_scoring("m", "claude-opus-5-5", "msgbatch_01abc", TITLES, NAMES, records)
+        self.assertIn("## Q2 題2: 判定なし（errored）", text)
+        self.assertIn("## Q3 題3: 判定なし（missing）", text)
+        self.assertNotIn("合計", text)
+
+
 if __name__ == "__main__":
     unittest.main()
