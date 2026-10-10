@@ -202,21 +202,20 @@ class MetricsTest(unittest.TestCase):
         self.assertAlmostEqual(judge.stability(runs), 0.8)
 
     def test_verdict_passes_exactly_at_thresholds(self):
-        self.assertEqual(judge.verdict(PASSING, 0.9, 0), [])
-        self.assertEqual(judge.verdict({**PASSING, "bias": -1.5}, 0.9, 0), [])
+        self.assertEqual(judge.verdict(PASSING, 0.9), [])
+        self.assertEqual(judge.verdict({**PASSING, "bias": -1.5}, 0.9), [])
 
     def test_verdict_fails_just_past_each_threshold(self):
         cases = [
-            ({**PASSING, "band_agree": 0.79}, 0.9, 0, "レンジ一致"),
-            ({**PASSING, "mae": 1.51}, 0.9, 0, "平均絶対誤差"),
-            ({**PASSING, "total_within": 19 / 24}, 0.9, 0, "合計差"),
-            (PASSING, 0.89, 0, "幅"),
-            (PASSING, 0.9, 1, "捏造"),
-            ({**PASSING, "bias": 1.51}, 0.9, 0, "偏り"),
-            ({**PASSING, "bias": -1.51}, 0.9, 0, "偏り"),
+            ({**PASSING, "band_agree": 0.79}, 0.9, "レンジ一致"),
+            ({**PASSING, "mae": 1.51}, 0.9, "平均絶対誤差"),
+            ({**PASSING, "total_within": 19 / 24}, 0.9, "合計差"),
+            (PASSING, 0.89, "幅"),
+            ({**PASSING, "bias": 1.51}, 0.9, "偏り"),
+            ({**PASSING, "bias": -1.51}, 0.9, "偏り"),
         ]
-        for m, stable, fab, word in cases:
-            reasons = judge.verdict(m, stable, fab)
+        for m, stable, word in cases:
+            reasons = judge.verdict(m, stable)
             self.assertEqual(len(reasons), 1, word)
             self.assertIn(word, reasons[0])
 
@@ -358,17 +357,20 @@ class CliTest(unittest.TestCase):
             code = judge.main(argv, root=self.root, http=http or fake_http({}), env=self.env if env is None else env)
         return code, out.getvalue(), err.getvalue()
 
-    def ended_http(self, qs=(1, 2, 3), errored=(), scores=None):
+    def ended_http(self, qs=(1, 2, 3), errored=(), scores=None, runs=1, fabricated=(), model="opus55", dir_name=None):
+        dir_name = dir_name or self.DIR
         hand = judge.parse_hand_scores((self.root / "results" / self.DIR / "scoring.md").read_text())
         lines = []
-        for q in qs:
-            cid = f"{self.DIR}__q{q}__opus55__r0"
-            if q in errored:
-                lines.append(json.dumps({"custom_id": cid, "result": {"type": "errored", "error": {}}}))
-                continue
-            answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
-            judgment = make_judgment((scores or {}).get(q, hand[q]), [answer.strip()[:10]])
-            lines.append(json.dumps(succeeded(cid, judgment), ensure_ascii=False))
+        for run in range(runs):
+            for q in qs:
+                cid = f"{dir_name}__q{q}__{model}__r{run}"
+                if q in errored:
+                    lines.append(json.dumps({"custom_id": cid, "result": {"type": "errored", "error": {}}}))
+                    continue
+                answer = (self.root / "results" / self.DIR / f"q{q}_raw.txt").read_text()
+                quote = "回答にない文" if (q, run) in fabricated else answer.strip()[:10]
+                judgment = make_judgment((scores or {}).get(q, hand[q]), [quote])
+                lines.append(json.dumps(succeeded(cid, judgment), ensure_ascii=False))
         return fake_http({
             ("GET", f"{judge.API}/msgbatch_01abc"): b'{"processing_status": "ended", "results_url": "https://r", "request_counts": {}}',
             ("GET", "https://r"): "\n".join(lines).encode(),
@@ -431,13 +433,13 @@ class CliTest(unittest.TestCase):
         self.assertIn("batch ID", err)
 
     def test_calibrate_passes_when_judge_matches_hand_scores(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(runs=3))
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
         self.assertIn("opus55: 合格", out)
 
     def test_calibrate_reports_undecidable_when_a_judgment_is_missing(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(runs=3))
         (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__opus55__r0.json").unlink()
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
@@ -486,9 +488,9 @@ class EdgeInputTest(unittest.TestCase):
 
     def test_verdict_reasons_are_exact(self):
         m = {"band_agree": 0.5, "mae": 2.0, "bias": 2.0, "total_within": 0.5}
-        self.assertEqual(judge.verdict(m, 0.5, 1), [
+        self.assertEqual(judge.verdict(m, 0.5), [
             "レンジ一致が80%未満", "平均絶対誤差が1.5点超", "合計差5点以内の回答が83%未満",
-            "採点ごとの幅2点以内が90%未満", "引用の捏造が1件", "偏りが±1.5点超"])
+            "採点ごとの幅2点以内が90%未満", "偏りが±1.5点超"])
 
 
 class HttpDetailTest(unittest.TestCase):
@@ -586,14 +588,11 @@ class CliDetailTest(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_calibrate_reports_every_failed_condition(self):
-        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(scores={1: [10, 10, 10, 10, 10]}))
-        path = self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__opus55__r0.json"
-        rec = json.loads(path.read_text())
-        path.write_text(json.dumps({**rec, "fabricated": ["x"]}, ensure_ascii=False))
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(scores={1: [10, 10, 10, 10, 10]}, runs=3))
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(out, (
-            "opus55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が83%未満、引用の捏造が1件、偏りが±1.5点超）\n"
-            "  レンジ一致 66.7% / 平均絶対誤差 1.87 / 偏り +1.87 / 合計差5点以内 66.7% / 1回の幅2点以内 100.0% / 捏造 1件\n"))
+            "opus55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が83%未満、偏りが±1.5点超）\n"
+            "  レンジ一致 66.7% / 平均絶対誤差 1.87 / 偏り +1.87 / 合計差5点以内 66.7% / 3回の幅2点以内 100.0%\n"))
 
     def test_missing_key_message_is_exact(self):
         _, _, err = self.run_main(["collect", "msgbatch_01abc"], env={})
@@ -697,6 +696,161 @@ class SubmitExamplesTest(unittest.TestCase):
         code, _, http = self.submit(["submit", "--examples", "other-model", self.DIR])
         self.assertEqual(code, 0)
         self.assertIn('<example dir="other-model">', http.calls[0][2]["requests"][0]["params"]["system"][1]["text"])
+
+
+class ReviewRound1Test(unittest.TestCase):
+    DIR = CliTest.DIR
+    setUp = CliTest.setUp
+    run_main = CliTest.run_main
+    ended_http = CliTest.ended_http
+
+    def add_other_dir(self):
+        shutil.copytree(self.root / "results" / self.DIR, self.root / "results" / "other-model")
+
+    def post_http(self):
+        return fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
+
+    def test_example_aliases_and_unknown_dirs_are_rejected_without_sending(self):
+        self.add_other_dir()
+        for alias in ("qwen35-9b/", "./qwen35-9b", "QWEN35-9B", "../results/qwen35-9b", "no-such"):
+            http = self.post_http()
+            code, _, err = self.run_main(["submit", "--examples", alias, self.DIR], http)
+            self.assertEqual(code, 1, alias)
+            self.assertEqual(err, f"エラー: 採点例がresults/にありません: ['{alias}']\n")
+            self.assertEqual(http.calls, [], alias)
+
+    def test_target_aliases_and_unknown_dirs_are_rejected_without_sending(self):
+        for alias in ("QWEN35-9B", "qwen35-9b/", "no-such"):
+            http = self.post_http()
+            code, _, err = self.run_main(["submit", alias], http)
+            self.assertEqual(code, 1, alias)
+            self.assertEqual(err, f"エラー: 採点対象がresults/にありません: ['{alias}']\n")
+            self.assertEqual(http.calls, [], alias)
+
+    def test_duplicate_targets_and_models_are_sent_once(self):
+        http = self.post_http()
+        self.run_main(["submit", "--model", "claude-opus-5-5", "--model", "claude-opus-5-5", self.DIR, self.DIR], http)
+        ids = [r["custom_id"] for r in http.calls[0][2]["requests"]]
+        self.assertEqual(ids, [f"{self.DIR}__q{q}__opus55__r0" for q in (1, 2, 3)])
+
+    def test_missing_answer_file_is_a_clear_error(self):
+        (self.root / "results" / self.DIR / "q2_raw.txt").unlink()
+        http = self.post_http()
+        code, _, err = self.run_main(["submit", self.DIR], http)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, f"エラー: 回答がありません: {self.root / 'results' / self.DIR / 'q2_raw.txt'}\n")
+        self.assertEqual(http.calls, [])
+
+    def test_submit_without_examples_warns(self):
+        code, _, err = self.run_main(["submit", self.DIR], self.post_http())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "警告: 採点例がありません。校正に合格したのは採点例ありの構成です\n")
+
+    def test_collect_with_unknown_dir_is_a_clear_error(self):
+        code, _, err = self.run_main(["collect", "msgbatch_01abc"], self.ended_http(dir_name="gone-model"))
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("エラー: 回答がありません: "), err)
+
+    def test_collect_of_removed_model_writes_draft_with_short_name(self):
+        code, _, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http(model="sonnet55"))
+        self.assertEqual(code, 0)
+        draft = (self.root / "results" / self.DIR / "scoring.judge.md").read_text()
+        self.assertIn("判定モデルはsonnet55、", draft)
+
+    def test_fabricated_quote_from_collect_fails_calibration(self):
+        self.run_main(["collect", "msgbatch_01abc"], self.ended_http(runs=3, fabricated={(2, 1)}))
+        code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "opus55: 不合格（引用の捏造が1件）\n")
+
+    def test_fewer_than_three_runs_is_undecidable(self):
+        for runs in (1, 2):
+            shutil.rmtree(self.root / "judge-out", ignore_errors=True)
+            self.run_main(["collect", "msgbatch_01abc"], self.ended_http(runs=runs))
+            _, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
+            self.assertEqual(out, f"opus55: 判定不能（採点回数{runs}回、3回必要）\n")
+
+    def test_calibrate_rejects_path_like_batch_id(self):
+        code, _, err = self.run_main(["calibrate", "../x"])
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "エラー: batch IDの形式が違います: '../x'\n")
+
+    def test_trailing_newline_is_rejected_by_format_checks(self):
+        with self.assertRaisesRegex(judge.JudgeError, "batch ID"):
+            judge.check_batch_id("msgbatch_01abc\n")
+        with self.assertRaisesRegex(judge.JudgeError, "使えない文字"):
+            judge.make_custom_id("abc\n", 1, "opus55", 0)
+
+
+class SchemaAndApiRobustnessTest(unittest.TestCase):
+    def test_wrong_field_types_are_invalid_not_crash(self):
+        cases = {
+            "truncatedが真偽値ではありません": lambda o: o.pop("truncated"),
+            "観点の重複か欠落があります": lambda o: o["criteria"][0].update(id=1.0),
+            "観点1のreasonが文字列ではありません": lambda o: o["criteria"][0].pop("reason"),
+            "観点1のevidenceが文字列のリストではありません": lambda o: o["criteria"][0].update(evidence="座席"),
+        }
+        for message, mutate in cases.items():
+            obj = make_judgment([1, 2, 3, 4, 5])
+            mutate(obj)
+            self.assertTrue(judge.check_schema(obj).startswith(message), message)
+        obj = make_judgment([1, 2, 3, 4, 5])
+        obj["criteria"][0]["evidence"] = [3]
+        self.assertTrue(judge.check_schema(obj).startswith("観点1のevidenceが文字列のリストではありません"))
+
+    def test_invalid_record_keeps_stop_reason(self):
+        result = succeeded("m__q1__opus55__r0", '{"truncated": fal')
+        result["result"]["message"]["stop_reason"] = "max_tokens"
+        self.assertEqual(judge.classify(result, {("m", 1): "a"})["stop_reason"], "max_tokens")
+
+    def test_non_json_api_response_is_a_clear_error(self):
+        http = fake_http({("POST", judge.API): b"<html>bad gateway</html>"})
+        with self.assertRaisesRegex(judge.JudgeError, "APIの応答をJSONとして読めません"):
+            judge.create_batch([], KEY, http)
+        http = fake_http({("POST", judge.API): b'{"type": "message_batch"}'})
+        with self.assertRaisesRegex(judge.JudgeError, "batch IDがありません"):
+            judge.create_batch([], KEY, http)
+
+    def test_read_timeout_is_wrapped(self):
+        res = mock.MagicMock()
+        res.__enter__.return_value.read.side_effect = TimeoutError("timed out")
+        with mock.patch("urllib.request.urlopen", return_value=res):
+            with self.assertRaisesRegex(judge.JudgeError, "^APIとの通信に失敗しました: timed out$"):
+                judge.http_request("GET", judge.API, KEY)
+
+    def test_draft_puts_multiline_quote_and_reason_on_one_line(self):
+        obj = make_judgment([1, 2, 3, 4, 5], ["一行目\n## 見出し"])
+        obj["criteria"][0]["reason"] = "理由の\n続き"
+        text = judge.render_scoring("m", "M", "msgbatch_01abc", TITLES, NAMES, {1: {"status": "ok", "judgment": obj}})
+        self.assertIn("- 観点1・壊してはいけない条件: 1点。理由の 続き「一行目 ## 見出し」\n", text)
+        self.assertEqual(judge.parse_hand_scores(text), {1: [1, 2, 3, 4, 5]})
+
+
+class CalibrationDetailTest(unittest.TestCase):
+    HAND = {("m", 1): [5, 5, 5, 5, 5]}
+
+    def record(self, run, scores):
+        return {"run": run, "status": "ok", "dir": "m", "q": 1, "judgment": make_judgment(scores)}
+
+    def test_metrics_use_the_first_run(self):
+        records = [self.record(0, [5, 5, 5, 5, 5]), self.record(1, [7, 7, 7, 7, 7]), self.record(2, [5, 5, 5, 5, 5])]
+        self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), (
+            "opus55: 合格\n"
+            "  レンジ一致 100.0% / 平均絶対誤差 0.00 / 偏り +0.00 / 合計差5点以内 100.0% / 3回の幅2点以内 100.0%"))
+
+    def test_runs_without_the_first_run_are_undecidable(self):
+        records = [self.record(run, [5, 5, 5, 5, 5]) for run in (1, 2, 3)]
+        self.assertEqual(judge.calibrate_model("opus55", self.HAND, records), "opus55: 判定不能（判定が欠けた回答 0件）")
+
+    def test_criterion_without_evidence_passes_schema(self):
+        obj = make_judgment([1, 2, 3, 4, 5])
+        del obj["criteria"][0]["evidence"]
+        self.assertIsNone(judge.check_schema(obj))
+
+    def test_non_json_message_shows_first_200_bytes(self):
+        with self.assertRaises(judge.JudgeError) as cm:
+            judge.load_json(b"x" * 300)
+        self.assertEqual(str(cm.exception), f"APIの応答をJSONとして読めません: {b'x' * 200!r}")
 
 
 if __name__ == "__main__":

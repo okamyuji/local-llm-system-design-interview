@@ -60,17 +60,17 @@ def parse_criteria_names(text: str) -> list[str]:
 
 
 MODEL_SHORT = {"claude-opus-5-5": "opus55"}
-DIR_RE = re.compile(r"^[a-zA-Z0-9-]+$")
-CUSTOM_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+DIR_RE = re.compile(r"[a-zA-Z0-9-]+")
+CUSTOM_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,64}")
 SPLIT_RE = re.compile(r"([a-zA-Z0-9-]+)__q([1-3])__([a-z0-9]+)__r(\d+)")
 
 
 def make_custom_id(dir_name: str, q: int, model_short: str, run: int) -> str:
     # "__"を区切りに使うので、ディレクトリ名には下線を許さない
-    if not DIR_RE.match(dir_name):
+    if not DIR_RE.fullmatch(dir_name):
         raise JudgeError(f"ディレクトリ名に使えない文字があります（英数字とハイフンだけ）: {dir_name}")
     cid = f"{dir_name}__q{q}__{model_short}__r{run}"
-    if not CUSTOM_ID_RE.match(cid):
+    if not CUSTOM_ID_RE.fullmatch(cid):
         raise JudgeError(f"custom_idが64文字を超えます: {cid}")
     return cid
 
@@ -143,13 +143,26 @@ def check_schema(obj) -> str | None:
         return "criteriaがありません"
     criteria = obj["criteria"]
     ids = [c.get("id") if isinstance(c, dict) else None for c in criteria]
-    if len(criteria) != 5 or set(ids) != {1, 2, 3, 4, 5}:
+    # bool は int の派生型で、1.0 は 1 と等しいので、type で厳密に比べる
+    if len(criteria) != 5 or set(ids) != {1, 2, 3, 4, 5} or any(type(i) is not int for i in ids):
         return f"観点の重複か欠落があります: {ids}"
-    for c in criteria:
-        score = c.get("score")
-        # bool は int の派生型なので type で厳密に比べる
-        if type(score) is not int or not 0 <= score <= 10:
-            return f"観点{c['id']}の点数が0〜10の整数ではありません: {score!r}"
+    errors = [e for e in map(check_criterion, criteria) if e]
+    if errors:
+        return errors[0]
+    if type(obj.get("truncated")) is not bool:
+        return "truncatedが真偽値ではありません"
+    return None
+
+
+def check_criterion(c: dict) -> str | None:
+    score = c.get("score")
+    if type(score) is not int or not 0 <= score <= 10:
+        return f"観点{c['id']}の点数が0〜10の整数ではありません: {score!r}"
+    if not isinstance(c.get("reason"), str):
+        return f"観点{c['id']}のreasonが文字列ではありません"
+    evidence = c.get("evidence", [])
+    if not isinstance(evidence, list) or not all(isinstance(e, str) for e in evidence):
+        return f"観点{c['id']}のevidenceが文字列のリストではありません"
     return None
 
 
@@ -180,6 +193,7 @@ PASS_STABLE = 0.9
 MAX_BIAS = 1.5
 TOTAL_TOLERANCE = 5
 SPAN_TOLERANCE = 2
+REQUIRED_RUNS = 3
 
 
 def band(score: int) -> int:
@@ -202,7 +216,7 @@ def stability(runs: list[dict[tuple[str, int], list[int]]]) -> float:
     return sum(s <= SPAN_TOLERANCE for s in spans) / len(spans)
 
 
-def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
+def verdict(m: dict, stable: float) -> list[str]:
     reasons = []
     if m["band_agree"] < PASS_BAND:
         reasons.append(f"レンジ一致が{PASS_BAND:.0%}未満")
@@ -212,8 +226,6 @@ def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
         reasons.append(f"合計差{TOTAL_TOLERANCE}点以内の回答が{PASS_TOTAL:.0%}未満")
     if stable < PASS_STABLE:
         reasons.append(f"採点ごとの幅2点以内が{PASS_STABLE:.0%}未満")
-    if fabricated:
-        reasons.append(f"引用の捏造が{fabricated}件")
     if abs(m["bias"]) > MAX_BIAS:
         reasons.append(f"偏りが±{MAX_BIAS}点超")
     return reasons
@@ -221,7 +233,7 @@ def verdict(m: dict, stable: float, fabricated: int) -> list[str]:
 
 API = "https://api.anthropic.com/v1/messages/batches"
 API_VERSION = "2023-06-01"
-BATCH_ID_RE = re.compile(r"^msgbatch_[A-Za-z0-9]+$")
+BATCH_ID_RE = re.compile(r"msgbatch_[A-Za-z0-9]+")
 
 
 def http_request(method: str, url: str, key: str, body: dict | None = None) -> bytes:
@@ -235,25 +247,37 @@ def http_request(method: str, url: str, key: str, body: dict | None = None) -> b
         raise JudgeError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
     except urllib.error.URLError as e:
         raise JudgeError(f"APIに接続できません: {e.reason}") from e
+    except OSError as e:
+        raise JudgeError(f"APIとの通信に失敗しました: {e}") from e
+
+
+def load_json(raw: bytes):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise JudgeError(f"APIの応答をJSONとして読めません: {raw[:200]!r}") from e
 
 
 def create_batch(requests: list[dict], key: str, http=http_request) -> str:
-    return json.loads(http("POST", API, key, {"requests": requests}))["id"]
+    res = load_json(http("POST", API, key, {"requests": requests}))
+    if "id" not in res:
+        raise JudgeError(f"APIの応答にbatch IDがありません: {res}")
+    return res["id"]
 
 
 def check_batch_id(batch_id: str) -> str:
     # batch ID は URL とディレクトリ名に使うので、形式外は通さない
-    if not BATCH_ID_RE.match(batch_id):
+    if not BATCH_ID_RE.fullmatch(batch_id):
         raise JudgeError(f"batch IDの形式が違います: {batch_id!r}")
     return batch_id
 
 
 def get_batch(batch_id: str, key: str, http=http_request) -> dict:
-    return json.loads(http("GET", f"{API}/{check_batch_id(batch_id)}", key))
+    return load_json(http("GET", f"{API}/{check_batch_id(batch_id)}", key))
 
 
 def get_results(url: str, key: str, http=http_request) -> list[dict]:
-    return [json.loads(line) for line in http("GET", url, key).decode().splitlines() if line.strip()]
+    return [load_json(line) for line in http("GET", url, key).decode().splitlines() if line.strip()]
 
 
 def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
@@ -266,7 +290,8 @@ def classify(result: dict, answers: dict[tuple[str, int], str]) -> dict:
     text = "".join(b.get("text", "") for b in outcome["message"]["content"] if b.get("type") == "text")
     judgment, error, fabricated = validate_judgment(text, answers[(dir_name, q)])
     if error:
-        return {**rec, "status": "invalid", "error": error, "fabricated": fabricated, "raw": text}
+        return {**rec, "status": "invalid", "error": error, "fabricated": fabricated, "raw": text,
+                "stop_reason": outcome["message"].get("stop_reason")}
     return {**rec, "status": "ok", "judgment": judgment}
 
 
@@ -286,8 +311,8 @@ def render_scoring(dir_name: str, model: str, batch_id: str, titles: dict[int, s
         if rec["judgment"]["truncated"]:
             lines += ["回答は途中で切れていると判定しました。", ""]
         for c in criteria:
-            quotes = "".join(f"「{e}」" for e in c["evidence"])
-            lines.append(f"- 観点{c['id']}・{names[c['id'] - 1]}: {c['score']}点。{c['reason']}{quotes}")
+            quotes = "".join(f"「{normalize_ws(e)}」" for e in c["evidence"])
+            lines.append(f"- 観点{c['id']}・{names[c['id'] - 1]}: {c['score']}点。{normalize_ws(c['reason'])}{quotes}")
         lines.append("")
     if len(totals) == 3:
         lines.append(f"- 合計: {sum(totals)}/150")
@@ -304,7 +329,14 @@ def list_dirs(root: Path) -> list[str]:
 
 
 def load_answers(root: Path, dirs: list[str]) -> dict[tuple[str, int], str]:
-    return {(d, q): (root / "results" / d / f"q{q}_raw.txt").read_text() for d in dirs for q in (1, 2, 3)}
+    answers = {}
+    for d in dirs:
+        for q in (1, 2, 3):
+            path = root / "results" / d / f"q{q}_raw.txt"
+            if not path.exists():
+                raise JudgeError(f"回答がありません: {path}")
+            answers[(d, q)] = path.read_text()
+    return answers
 
 
 def scores_of(rec: dict) -> list[int]:
@@ -319,8 +351,13 @@ def read_hand_scoring(root: Path, dir_name: str) -> str:
 
 
 def pick_examples(root: Path, dirs: list[str], chosen: list[str] | None) -> list[str]:
+    known = list_dirs(root)
     if chosen is None:
-        return [d for d in list_dirs(root) if d not in dirs and (root / "results" / d / "scoring.md").exists()]
+        return [d for d in known if d not in dirs and (root / "results" / d / "scoring.md").exists()]
+    chosen = list(dict.fromkeys(chosen))
+    unknown = [d for d in chosen if d not in known]
+    if unknown:
+        raise JudgeError(f"採点例がresults/にありません: {unknown}")
     overlap = sorted(set(chosen) & set(dirs))
     if overlap:
         raise JudgeError(f"採点対象を採点例に含めることはできません: {overlap}")
@@ -337,12 +374,18 @@ def load_examples(root: Path, dirs: list[str]) -> str:
 def cmd_submit(args, root: Path, key: str, http) -> int:
     rubric = (root / "rubric.md").read_text()
     questions = parse_questions((root / "questions.md").read_text())
-    dirs = args.dirs or list_dirs(root)
-    models = args.model or [DEFAULT_MODEL]
+    known = list_dirs(root)
+    dirs = list(dict.fromkeys(args.dirs)) or known
+    unknown = [d for d in dirs if d not in known]
+    if unknown:
+        raise JudgeError(f"採点対象がresults/にありません: {unknown}")
+    models = list(dict.fromkeys(args.model or [DEFAULT_MODEL]))
     ids = [(make_custom_id(d, q, MODEL_SHORT[m], r), m, d, q)
            for m in models for r in range(args.runs) for d in dirs for q in (1, 2, 3)]
     answers = load_answers(root, dirs)
     examples = load_examples(root, pick_examples(root, dirs, args.examples))
+    if not examples:
+        print("警告: 採点例がありません。校正に合格したのは採点例ありの構成です", file=sys.stderr)
     requests = [build_request(cid, m, rubric, questions[q][1], answers[(d, q)], examples) for cid, m, d, q in ids]
     batch_id = create_batch(requests, key, http)
     print(f"{batch_id} を作成しました（{len(requests)}件）。終わったら collect {batch_id} を実行してください。")
@@ -372,7 +415,7 @@ def cmd_collect(args, root: Path, key: str, http) -> int:
 def write_drafts(root: Path, batch_id: str, records: list[dict]) -> None:
     titles = {q: t for q, (t, _) in parse_questions((root / "questions.md").read_text()).items()}
     names = parse_criteria_names((root / "rubric.md").read_text())
-    model = SHORT_MODEL[records[0]["model"]]
+    model = SHORT_MODEL.get(records[0]["model"], records[0]["model"])
     for d in sorted({r["dir"] for r in records}):
         by_q = {r["q"]: r for r in records if r["dir"] == d}
         path = root / "results" / d / "scoring.judge.md"
@@ -396,7 +439,12 @@ def cmd_calibrate(args, root: Path) -> int:
 
 
 def calibrate_model(model: str, hand: dict, records: list[dict]) -> str:
+    fabricated = sum(1 for r in records if r.get("fabricated"))
+    if fabricated:
+        return f"{model}: 不合格（引用の捏造が{fabricated}件）"
     runs: dict[int, dict[tuple[str, int], list[int]]] = {r["run"]: {} for r in records}
+    if len(runs) < REQUIRED_RUNS:
+        return f"{model}: 判定不能（採点回数{len(runs)}回、{REQUIRED_RUNS}回必要）"
     for r in records:
         if r["status"] == "ok":
             runs[r["run"]][(r["dir"], r["q"])] = scores_of(r)
@@ -405,12 +453,11 @@ def calibrate_model(model: str, hand: dict, records: list[dict]) -> str:
         return f"{model}: 判定不能（判定が欠けた回答 {missing}件）"
     m = compare(hand, runs[0])
     stable = stability([runs[k] for k in sorted(runs)])
-    fabricated = sum(1 for r in records if r.get("fabricated"))
-    reasons = verdict(m, stable, fabricated)
+    reasons = verdict(m, stable)
     head = "合格" if not reasons else "不合格（" + "、".join(reasons) + "）"
     return (f"{model}: {head}\n"
             f"  レンジ一致 {m['band_agree']:.1%} / 平均絶対誤差 {m['mae']:.2f} / 偏り {m['bias']:+.2f}"
-            f" / 合計差5点以内 {m['total_within']:.1%} / {len(runs)}回の幅2点以内 {stable:.1%} / 捏造 {fabricated}件")
+            f" / 合計差5点以内 {m['total_within']:.1%} / {len(runs)}回の幅2点以内 {stable:.1%}")
 
 
 def positive_int(text: str) -> int:
