@@ -1,6 +1,6 @@
 # local-llm-system-design-interview
 
-ローカルLLMにシステム設計面接の問題を解かせ、固定の採点基準で採点する実測リポジトリです。出題、採点基準、実行スクリプト、各モデルの回答全文と採点根拠をすべて収録しており、手元のマシンで同じ計測を再現できます。
+ローカルLLMにシステム設計面接の問題を解かせ、固定の採点基準で採点する実測リポジトリです。出題、採点基準、実行スクリプト、各モデルの回答全文と採点根拠をすべて収録しているので、読者が自分のマシンで同じ計測を再現できます。
 
 ## 収録内容
 
@@ -60,7 +60,9 @@ AGENT_WS=/path/to/go-llm-agent/llm-agent-workspace \
 bash scripts/run_all_models.sh
 ```
 
-モデルごとにllama-serverをポート8081で起動し、`/health`の応答を待ってから3問を順に出題し、終わったらサーバーを止めて次のモデルへ進む流れです。回答は`results/<モデル名>/q1_raw.txt`〜`q3_raw.txt`へ、所要時間は`q*_time.txt`へ保存されます。
+モデルごとにllama-serverをポート8081で起動し、`/health`の応答を待ってから3問を順に出題し、終わったらサーバーを止めて次のモデルへ進む流れです。回答は`results/<モデル名>/q1_raw.txt`〜`q3_raw.txt`へ、所要時間は`q*_time.txt`へ保存されます。llama-serverのログは`$TMPDIR`に一意な名前で作られ、起動時の行にそのパスが表示されます。
+
+検索併用条件の`run_model_tools.sh`へ渡すconfigでは、`agent.enabled_tools`を`[web_search, web_fetch]`だけにしてください。検索結果の文章に書かれた指示で、shellなどほかのツールが動かないようにするためです。
 
 1モデルだけ測る場合は、llama-serverを自分で起動したうえで`run_model.sh`を直接呼んでください。
 
@@ -71,6 +73,30 @@ AGENT_BIN=... AGENT_WS=... bash scripts/run_model.sh results/my-model llamacpp/g
 ### 4. 採点する
 
 `rubric.md`の5基準へ機械的に当てはめます。採点は回答を見る前に固定した基準で行い、基準ごとに回答から根拠を引用して`results/<モデル名>/scoring.md`へ残します。
+
+### 5. 自動採点の下書きを作る（任意）
+
+`scripts/judge.py`は、`rubric.md`の5観点で回答を採点した下書きを、AnthropicのMessage Batches APIで作ります。下書きは`results/<モデル名>/scoring.judge.md`に書かれ、`scoring.md`は変更しません。下書きは必ず人が回答と照合してから`scoring.md`へ反映してください。
+
+```bash
+export ANTHROPIC_API_KEY=...            # Claude ConsoleのAPIキー
+python3 scripts/judge.py submit my-model # 対象ディレクトリを省くとresults/配下すべて
+python3 scripts/judge.py collect <batch ID>
+```
+
+バッチの処理には最長24時間かかります。`collect`は処理中なら状況を表示して終了コード2で終わるので、時間をおいて再実行してください。判定の生データは`judge-out/<batch ID>/`に保存されます。
+
+採点の水準を手採点に合わせるため、手採点済みのほかのモデルの`scoring.md`を採点例として渡します。`--examples`を省くと、採点対象以外の手採点がすべて採点例になります。採点対象と採点例には`results/`配下のディレクトリ名をそのまま書いてください。採点対象と、採点対象と同じ内容の手採点か回答を持つディレクトリは、採点例に含められません。採点例が1つもないときは、校正していない構成なので警告を出します。回答は要求ごとに乱数を含むタグで囲んで送るため、回答の中に閉じタグや指示が書かれていても区切りは壊れません。
+
+手採点と判定の一致を確かめるときは、手採点済みの回答を採点例と採点対象に分け、同じ回答を3回採点してから`calibrate`で比べてください。`calibrate`は、引用の捏造が1件でもあれば不合格とし、採点が3回に満たないときは判定しません。
+
+```bash
+python3 scripts/judge.py submit --model claude-opus-5-5 --runs 3 \
+  --examples gemma4-e4b --examples gemma4-e4b-tools --examples qwen35-9b --examples qwen35-9b-tools \
+  qwen25-coder-14b qwen25-coder-14b-tools shisa-v2-12b shisa-v2-12b-tools
+python3 scripts/judge.py collect <batch ID>
+python3 scripts/judge.py calibrate <batch ID>
+```
 
 ## 計測条件の注意
 

@@ -17,12 +17,16 @@ RUNNER="$(cd "$(dirname "$0")" && pwd)/run_model.sh"
 
 run_one() {
   local gguf="$1" outdir="$2" alias="$3"
-  echo "##### $outdir: server start $(date +%H:%M:%S)"
+  # 共有の /tmp に固定名で書くと、他の利用者が置いた symlink を上書きしうる
+  local log
+  local tmp="${TMPDIR:-/tmp}"
+  log="$(mktemp "${tmp%/}/llama-$PORT-$outdir.XXXXXX")" || return 1
+  echo "##### $outdir: server start $(date +%H:%M:%S) log=$log"
   "$LLAMA_SERVER" -m "$MODELDIR/$gguf" --jinja -c 8192 --port "$PORT" --host 127.0.0.1 \
-    > "/tmp/llama-$PORT-$outdir.log" 2>&1 &
+    > "$log" 2>&1 &
   local pid=$!
   local ok=0
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" | grep -q '"ok"'; then ok=1; break; fi
     sleep 3
   done
