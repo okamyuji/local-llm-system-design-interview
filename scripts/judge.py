@@ -59,7 +59,7 @@ def parse_criteria_names(text: str) -> list[str]:
     return [found[i] for i in range(1, 6)]
 
 
-MODEL_SHORT = {"claude-opus-5-5": "opus55", "claude-sonnet-5-5": "sonnet55"}
+MODEL_SHORT = {"claude-opus-5-5": "opus55"}
 DIR_RE = re.compile(r"^[a-zA-Z0-9-]+$")
 CUSTOM_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 SPLIT_RE = re.compile(r"([a-zA-Z0-9-]+)__q([1-3])__([a-z0-9]+)__r(\d+)")
@@ -295,7 +295,7 @@ def render_scoring(dir_name: str, model: str, batch_id: str, titles: dict[int, s
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 SHORT_MODEL = {v: k for k, v in MODEL_SHORT.items()}
 
 

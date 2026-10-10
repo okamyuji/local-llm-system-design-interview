@@ -362,7 +362,7 @@ class CliTest(unittest.TestCase):
         hand = judge.parse_hand_scores((self.root / "results" / self.DIR / "scoring.md").read_text())
         lines = []
         for q in qs:
-            cid = f"{self.DIR}__q{q}__sonnet55__r0"
+            cid = f"{self.DIR}__q{q}__opus55__r0"
             if q in errored:
                 lines.append(json.dumps({"custom_id": cid, "result": {"type": "errored", "error": {}}}))
                 continue
@@ -381,12 +381,16 @@ class CliTest(unittest.TestCase):
 
     def test_submit_builds_one_request_per_answer_model_and_run(self):
         http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
-        code, out, _ = self.run_main(["submit", "--model", "claude-opus-5-5", "--model", "claude-sonnet-5-5", "--runs", "2"], http)
+        code, out, _ = self.run_main(["submit", "--model", "claude-opus-5-5", "--runs", "2"], http)
         self.assertEqual(code, 0)
         self.assertIn("msgbatch_01abc", out)
         ids = [r["custom_id"] for r in http.calls[0][2]["requests"]]
-        self.assertEqual(len(ids), 12)
+        self.assertEqual(len(ids), 6)
         self.assertIn("qwen35-9b__q3__opus55__r1", ids)
+
+    def test_default_model_is_the_calibrated_opus(self):
+        self.assertEqual(judge.DEFAULT_MODEL, "claude-opus-5-5")
+        self.assertEqual(judge.MODEL_SHORT, {"claude-opus-5-5": "opus55"})
 
     def test_submit_defaults_to_one_run_of_default_model(self):
         http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
@@ -430,14 +434,14 @@ class CliTest(unittest.TestCase):
         self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
-        self.assertIn("sonnet55: 合格", out)
+        self.assertIn("opus55: 合格", out)
 
     def test_calibrate_reports_undecidable_when_a_judgment_is_missing(self):
         self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
-        (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__sonnet55__r0.json").unlink()
+        (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__opus55__r0.json").unlink()
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(code, 0)
-        self.assertIn("sonnet55: 判定不能（判定が欠けた回答 1件）\n", out)
+        self.assertIn("opus55: 判定不能（判定が欠けた回答 1件）\n", out)
 
     def test_calibrate_fails_clearly_without_hand_scores(self):
         self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
@@ -551,7 +555,7 @@ class CliDetailTest(unittest.TestCase):
         http = fake_http({("POST", judge.API): b'{"id": "msgbatch_01abc"}'})
         self.run_main(["submit", "--runs", "1"], http)
         reqs = http.calls[0][2]["requests"]
-        self.assertEqual([r["custom_id"] for r in reqs], [f"{self.DIR}__q{q}__sonnet55__r0" for q in (1, 2, 3)])
+        self.assertEqual([r["custom_id"] for r in reqs], [f"{self.DIR}__q{q}__opus55__r0" for q in (1, 2, 3)])
         rubric = (self.root / "rubric.md").read_text()
         questions = judge.parse_questions((self.root / "questions.md").read_text())
         for q, r in zip((1, 2, 3), reqs):
@@ -564,7 +568,7 @@ class CliDetailTest(unittest.TestCase):
             code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http())
             self.assertEqual(code, 0)
         self.assertIn("judge-out", os.listdir(self.root))
-        saved = (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q1__sonnet55__r0.json").read_text()
+        saved = (self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q1__opus55__r0.json").read_text()
         self.assertEqual(saved, json.dumps(json.loads(saved), ensure_ascii=False, indent=2))
         draft_dir = self.root / "results" / self.DIR
         self.assertIn("scoring.judge.md", os.listdir(draft_dir))
@@ -574,7 +578,7 @@ class CliDetailTest(unittest.TestCase):
         code, out, _ = self.run_main(["collect", "msgbatch_01abc"], self.ended_http(errored=(2,)))
         self.assertIn("errored 1 / ok 2（保存先 ", out)
         draft = (self.root / "results" / self.DIR / "scoring.judge.md").read_text()
-        self.assertTrue(draft.startswith(f"# {self.DIR} 自動採点の下書き\n\n判定モデルはclaude-sonnet-5-5、batch IDはmsgbatch_01abcです。"))
+        self.assertTrue(draft.startswith(f"# {self.DIR} 自動採点の下書き\n\n判定モデルはclaude-opus-5-5、batch IDはmsgbatch_01abcです。"))
         self.assertIn("判定なし（errored）", draft)
 
     def test_collect_handles_single_result(self):
@@ -583,12 +587,12 @@ class CliDetailTest(unittest.TestCase):
 
     def test_calibrate_reports_every_failed_condition(self):
         self.run_main(["collect", "msgbatch_01abc"], self.ended_http(scores={1: [10, 10, 10, 10, 10]}))
-        path = self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__sonnet55__r0.json"
+        path = self.root / "judge-out" / "msgbatch_01abc" / f"{self.DIR}__q2__opus55__r0.json"
         rec = json.loads(path.read_text())
         path.write_text(json.dumps({**rec, "fabricated": ["x"]}, ensure_ascii=False))
         code, out, _ = self.run_main(["calibrate", "msgbatch_01abc"])
         self.assertEqual(out, (
-            "sonnet55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が83%未満、引用の捏造が1件、偏りが±1.5点超）\n"
+            "opus55: 不合格（レンジ一致が80%未満、平均絶対誤差が1.5点超、合計差5点以内の回答が83%未満、引用の捏造が1件、偏りが±1.5点超）\n"
             "  レンジ一致 66.7% / 平均絶対誤差 1.87 / 偏り +1.87 / 合計差5点以内 66.7% / 1回の幅2点以内 100.0% / 捏造 1件\n"))
 
     def test_missing_key_message_is_exact(self):
@@ -613,8 +617,8 @@ class CliDetailTest(unittest.TestCase):
                            ("calibrate", "手採点と比べて合否を出す")):
             self.assertRegex(out, rf"(?m)^\s+{name}\s+{text}$")
         _, out, _ = self.run_exit(["submit", "--help"])
-        self.assertIn("{claude-opus-5-5,claude-sonnet-5-5}", out)
-        self.assertRegex(out, r"\s判定モデル（既定 claude-sonnet-5-5、複数指定可）\n")
+        self.assertIn("{claude-opus-5-5}", out)
+        self.assertRegex(out, r"\s判定モデル（既定 claude-opus-5-5、複数指定可）\n")
         self.assertRegex(out, r"--runs RUNS\s+同じ回答を採点する回数\n")
         self.assertRegex(out, r"\s採点例にする手採点済みディレクトリ（省略時は対象以外の手採点すべて、複数指定可）\n")
         self.assertRegex(out, r"dirs\s+results/配下の対象ディレクトリ（省略時は全部）\n")
